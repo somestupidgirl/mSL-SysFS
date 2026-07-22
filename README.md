@@ -33,13 +33,13 @@ installed, replaced or omitted:
 | Piece | What it does | Where |
 |-------|--------------|-------|
 | **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | [mSL/FHS](https://github.com/somestupidgirl/mSL-FHS) |
-| **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | based on [Noah](https://github.com/ktemkin/noah) |
+| **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | [mSL/NABI](https://github.com/somestupidgirl/mSL-NABI) |
 | **procfs** | `/proc`, as a real filesystem | [mSL/ProcFS](https://github.com/somestupidgirl/mSL-ProcFS) |
 | **sysfs** | `/sys`, likewise | **this repository** |
 | **devfs** | `/dev` — already part of macOS | XNU |
 
-Targeting Apple Silicon natively makes [Asahi Linux](https://asahilinux.org/)
-the distribution of choice, since it is the one already built for this hardware.
+**This repository is the SysFS piece**, and it is a work in progress. The
+rest of this document describes it.
 
 ## What is sysfs?
 
