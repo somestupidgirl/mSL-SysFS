@@ -16,7 +16,7 @@
 	url = https://github.com/somestupidgirl/libbsdmalloc.git
 [submodule "lib/libkext"]
 	path = lib/libkext
-	url = https://github.com/somestupidgirl/libkext.git
+	url = git@github.com:somestupidgirl/libkext.git
 [submodule "lib/libreadfile"]
 	path = lib/libreadfile
 	url = https://github.com/somestupidgirl/libreadfile.git
