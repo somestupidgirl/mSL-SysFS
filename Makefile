@@ -77,7 +77,12 @@ LIB_FLAGS  := ARCHFLAGS="$(LIB_ARCHFLAGS)"  TARGET_TRIPLE="$(LIB_TRIPLE)"
 # Build  ->  $(OUT)
 # ---------------------------------------------------------------------------
 
-all: kextfs
+# `clean` first so a build always starts from a clean tree. This matters when
+# several arches are built in one checkout (e.g. CI runs `make ARCH=arm64e` then
+# `make ARCH=x86_64`): the single-arch kextfs only wipes $(OUT), so without this
+# the second build would relink the first arch's stale .o/.a files and fail with
+# "found architecture 'arm64e.kernel', required architecture 'x86_64'".
+all: clean kextfs
 
 ifeq ($(ARCH),universal)
 
