@@ -53,8 +53,17 @@ else ifeq ($(ARCH),x86_64)
     FS_TRIPLE         := x86_64-apple-macos10.15
     LIB_ARCHFLAGS     := -arch x86_64
     LIB_TRIPLE        := x86_64-apple-macos10.15
+else ifeq ($(ARCH),universal)
+    # The universal kextfs target builds each arch explicitly and lipos them;
+    # these defaults just need to be valid (the arm64e slice).
+    KEXT_ARCHFLAGS    := -arch arm64e
+    KEXT_TRIPLE       := arm64e-apple-macos12.0
+    FS_ARCHFLAGS      := -arch arm64
+    FS_TRIPLE         := arm64-apple-macos12.0
+    LIB_ARCHFLAGS     := -arch arm64e
+    LIB_TRIPLE        := arm64e-apple-macos12.0
 else
-    $(error Unknown ARCH=$(ARCH). Use arm64e or x86_64)
+    $(error Unknown ARCH=$(ARCH). Use arm64e, x86_64, or universal)
 endif
 
 KEXT_FLAGS := ARCHFLAGS="$(KEXT_ARCHFLAGS)" TARGET_TRIPLE="$(KEXT_TRIPLE)"
@@ -70,6 +79,41 @@ LIB_FLAGS  := ARCHFLAGS="$(LIB_ARCHFLAGS)"  TARGET_TRIPLE="$(LIB_TRIPLE)"
 
 all: kextfs
 
+ifeq ($(ARCH),universal)
+
+# kext + fs as fat (arm64e + x86_64) binaries: build each arch, then lipo the
+# Mach-O executables together and re-sign the bundles.
+kextfs:
+	rm -rf $(OUT)
+	mkdir $(OUT)
+	$(MAKE) -C lib  ARCHFLAGS="-arch arm64e" TARGET_TRIPLE="arm64e-apple-macos12.0"
+	$(MAKE) debug -C kext ARCHFLAGS="-arch arm64e" TARGET_TRIPLE="arm64e-apple-macos12.0"
+	$(MAKE) debug -C fs   ARCHFLAGS="-arch arm64"  TARGET_TRIPLE="arm64-apple-macos12.0"
+	mv kext/sysfs.kext kext/sysfs.kext.dSYM fs/sysfs.fs fs/sysfs.fs.dSYM $(OUT)
+	mv $(OUT)/sysfs.kext $(OUT)/sysfs.kext.arm64e
+	mv $(OUT)/sysfs.fs   $(OUT)/sysfs.fs.arm64
+	$(MAKE) -C kext clean
+	$(MAKE) -C fs clean
+	$(MAKE) -C lib clean
+	$(MAKE) -C lib  ARCHFLAGS="-arch x86_64" TARGET_TRIPLE="x86_64-apple-macos10.15"
+	$(MAKE) debug -C kext ARCHFLAGS="-arch x86_64" TARGET_TRIPLE="x86_64-apple-macos10.15"
+	$(MAKE) debug -C fs   ARCHFLAGS="-arch x86_64" TARGET_TRIPLE="x86_64-apple-macos10.15"
+	rm -rf $(OUT)/sysfs.kext.dSYM $(OUT)/sysfs.fs.dSYM
+	mv kext/sysfs.kext kext/sysfs.kext.dSYM fs/sysfs.fs fs/sysfs.fs.dSYM $(OUT)
+	mv $(OUT)/sysfs.kext $(OUT)/sysfs.kext.x86_64
+	mv $(OUT)/sysfs.fs   $(OUT)/sysfs.fs.x86_64
+	cp -r $(OUT)/sysfs.kext.arm64e $(OUT)/sysfs.kext
+	lipo -create $(OUT)/sysfs.kext.arm64e/Contents/MacOS/sysfs $(OUT)/sysfs.kext.x86_64/Contents/MacOS/sysfs -output $(OUT)/sysfs.kext/Contents/MacOS/sysfs
+	cp -r $(OUT)/sysfs.fs.arm64 $(OUT)/sysfs.fs
+	lipo -create $(OUT)/sysfs.fs.arm64/Contents/Resources/mount_sysfs $(OUT)/sysfs.fs.x86_64/Contents/Resources/mount_sysfs -output $(OUT)/sysfs.fs/Contents/Resources/mount_sysfs
+	codesign --force --timestamp=none --sign - $(OUT)/sysfs.kext
+	codesign --force --timestamp=none --sign - $(OUT)/sysfs.fs
+	rm -rf $(OUT)/sysfs.kext.arm64e $(OUT)/sysfs.kext.x86_64
+	rm -rf $(OUT)/sysfs.fs.arm64 $(OUT)/sysfs.fs.x86_64
+
+else
+
+# kext + fs for a single arch.
 kextfs:
 	rm -rf $(OUT)
 	mkdir $(OUT)
@@ -77,6 +121,8 @@ kextfs:
 	$(MAKE) debug -C kext $(KEXT_FLAGS)
 	$(MAKE) debug -C fs   $(FS_FLAGS)
 	mv kext/sysfs.kext kext/sysfs.kext.dSYM fs/sysfs.fs fs/sysfs.fs.dSYM $(OUT)
+
+endif
 
 # ---------------------------------------------------------------------------
 # Install / uninstall  (operate on the already-built $(OUT); need root)
