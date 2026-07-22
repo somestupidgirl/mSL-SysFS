@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BuildFlavor</key>
+	<string></string>
+	<key>BuildMachineOSBuild</key>
+	<string>__OSBUILD__</string>
+	<key>BuildMachineClangVersion</key>
+	<string>__CLANGVER__</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleGetInfoString</key>
+	<string>__FSVERSION__</string>
+	<key>CFBundleIdentifier</key>
+	<string>__BUNDLEID__</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>__FSNAME__</string>
+	<key>CFBundlePackageType</key>
+	<string>fs</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__FSBUILD__</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>FSPersonalities</key>
+	<dict>
+		<key>SysFS</key>
+		<dict>
+			<key>FSMountArguments</key>
+			<string></string>
+			<key>FSMountExecutable</key>
+			<string>mount_sysfs</string>
+			<key>FSName</key>
+			<string>System File System</string>
+		</dict>
+	</dict>
+	<key>CFBundleVersion</key>
+	<string>__FSVERSION__</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.bsd</key>
+		<string>20.0b1</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>20.0b1</string>
+	</dict>
+</dict>
+</plist>

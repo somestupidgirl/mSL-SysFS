@@ -57,3 +57,11 @@ dkms.conf
 
 # Other
 *.DS_Store
+
+# mSL/SysFS build outputs
+out/
+Info.plist~
+**/Info.plist~
+*.out
+*.fs
+**/*.fs

@@ -1,0 +1,22 @@
+[submodule "MacKernelSDK"]
+	path = lib/MacKernelSDK
+	url = git@github.com:acidanthera/MacKernelSDK.git
+[submodule "lib/libutil"]
+	path = lib/libutil
+	url = https://github.com/apple-oss-distributions/libutil.git
+[submodule "lib/xnu"]
+	path = lib/xnu
+	url = https://github.com/apple-oss-distributions/xnu.git
+        ignore = dirty
+[submodule "lib/libsbuf"]
+	path = lib/libsbuf
+	url = https://github.com/somestupidgirl/libsbuf.git
+[submodule "lib/libbsdmalloc"]
+	path = lib/libbsdmalloc
+	url = https://github.com/somestupidgirl/libbsdmalloc.git
+[submodule "lib/libkext"]
+	path = lib/libkext
+	url = https://github.com/somestupidgirl/libkext.git
+[submodule "lib/libreadfile"]
+	path = lib/libreadfile
+	url = https://github.com/somestupidgirl/libreadfile.git
