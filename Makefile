@@ -24,6 +24,15 @@ OUT=out
 # Install locations.
 EXT_DIR        := /Library/Extensions
 FS_DIR         := /Library/Filesystems
+SBIN_DIR       := /usr/local/sbin
+DAEMON_DIR     := /Library/LaunchDaemons
+SYNTHETIC_CONF := /etc/synthetic.conf
+
+# Auto-mount LaunchDaemon: mounts sysfs at /sys at boot (see tools/mount-sysfs).
+DAEMON_PLIST   := com.beako.sysfs.plist
+DAEMON_LABEL   := com.beako.sysfs
+MOUNT_SCRIPT   := mount-sysfs
+ARM_FLAG       := /var/db/sysfs.enabled
 
 # Detect native arch if ARCH not specified
 NATIVE_ARCH := $(shell uname -m)
@@ -141,8 +150,34 @@ install:
 	sudo cp -r "$(OUT)/sysfs.fs" "$(FS_DIR)/sysfs.fs"
 	sudo chmod -R 755 "$(FS_DIR)/sysfs.fs"
 	sudo chown -R root:wheel "$(FS_DIR)/sysfs.fs"
+	$(MAKE) install-daemon
+
+# The auto-mount LaunchDaemon: the mount-sysfs script + its plist, plus the
+# /sys mount point (created on the read-only system volume via synthetic.conf).
+# RunAtLoad means it starts on the next boot, but the mount itself stays gated
+# behind $(ARM_FLAG) so a kext fault cannot boot-loop the machine (see below).
+install-daemon:
+	sudo install -d -m 755 -o root -g wheel "$(SBIN_DIR)"
+	sudo install -m 755 -o root -g wheel "tools/$(MOUNT_SCRIPT)" "$(SBIN_DIR)/$(MOUNT_SCRIPT)"
+	sudo install -m 644 -o root -g wheel "tools/$(DAEMON_PLIST)" "$(DAEMON_DIR)/$(DAEMON_PLIST)"
+	@# A prior `launchctl disable` persists across boots in launchd's override
+	@# store and would keep the daemon from starting even though it is RunAtLoad.
+	-sudo launchctl enable "system/$(DAEMON_LABEL)" 2>/dev/null || true
+	@# Create the /sys mount point on the read-only system volume via synthetic.conf.
+	sudo sh -c 'grep -qxF sys "$(SYNTHETIC_CONF)" 2>/dev/null || printf "sys\n" >> "$(SYNTHETIC_CONF)"'
+	@echo "sysfs: installed the auto-mount LaunchDaemon and ensured 'sys' in $(SYNTHETIC_CONF)."
+	@echo "sysfs: auto-mount stays DISARMED. To enable it:"
+	@echo "         sudo touch $(ARM_FLAG)"
+	@echo "sysfs: then REBOOT (creates /sys, loads the kext, mounts sysfs at /sys)."
 
 uninstall:
+	-sudo launchctl bootout "system/$(DAEMON_LABEL)" 2>/dev/null || true
+	sudo rm -f "$(DAEMON_DIR)/$(DAEMON_PLIST)" || true
+	sudo rm -f "$(SBIN_DIR)/$(MOUNT_SCRIPT)" || true
+	@# Leave $(SYNTHETIC_CONF) and $(ARM_FLAG) for the operator to remove; drop the
+	@# synthetic 'sys' line so /sys is not created at the next boot.
+	-sudo sh -c 'test -f "$(SYNTHETIC_CONF)" && grep -vxF sys "$(SYNTHETIC_CONF)" > "$(SYNTHETIC_CONF).tmp" && mv "$(SYNTHETIC_CONF).tmp" "$(SYNTHETIC_CONF)"' 2>/dev/null || true
+	-mount | awk '/ on \/sys \(sysfs/ { print $$3 }' | while read -r mp; do sudo umount "$$mp" 2>/dev/null || true; done
 	sudo rm -rf "$(EXT_DIR)/sysfs.kext" || true
 	sudo rm -rf "$(FS_DIR)/sysfs.fs" || true
 
@@ -152,4 +187,4 @@ clean:
 	$(MAKE) -C fs clean || true
 	rm -rf $(OUT)
 
-.PHONY: all kextfs install uninstall clean
+.PHONY: all kextfs install install-daemon uninstall clean

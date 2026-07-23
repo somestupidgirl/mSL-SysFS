@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  sysfs auto-mount LaunchDaemon. Install to
+  /Library/LaunchDaemons/com.beako.sysfs.plist (owned root:wheel, mode 644),
+  with the mount-sysfs script at /usr/local/sbin/mount-sysfs, then:
+      sudo launchctl bootstrap system /Library/LaunchDaemons/com.beako.sysfs.plist
+
+  RunAtLoad runs it once at boot: the script loads the kext (if needed) and
+  mounts sysfs at /sys. It is a one-shot (no KeepAlive) - the script retries
+  internally while /sys and the kext come up, then exits. Mounting /sys needs
+  root, so this is a system LaunchDaemon rather than a per-user login agent.
+
+  Auto-mount is gated behind /var/db/sysfs.enabled so a fault in the (kernel)
+  sysfs code cannot boot-loop the machine; arm it with `sudo touch
+  /var/db/sysfs.enabled` (see the mount-sysfs script).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.beako.sysfs</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/sbin/mount-sysfs</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/sysfs-mount.log</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/sysfs-mount.log</string>
+</dict>
+</plist>

@@ -130,6 +130,7 @@ kext/                      the kernel extension
   sysfs_subr.c               generic helpers (allocvp, fileid, sizes)
   sysfs_iokit.cpp            in-kernel IORegistry walk (the one C++ TU)
 fs/                        the mount bundle (sysfs.fs) + mount_sysfs
+tools/                     boot auto-mount: mount-sysfs + com.beako.sysfs.plist
 lib/                       vendored libraries (git submodules)
 include/xnu/               vendored XNU private headers
 ```
@@ -163,9 +164,32 @@ kextstat | grep sysfs           # confirm it registered
 mkdir -p /tmp/sys
 sudo ./out/sysfs.fs/Contents/Resources/mount_sysfs sysfs /tmp/sys
 ls /tmp/sys                     # block bus class dev devices firmware ...
+ls /tmp/sys/devices             # the IOKit registry mirror
 sudo umount /tmp/sys
 sudo make -C kext unload
 ```
+
+### Auto-mounting at boot
+
+`sudo make install` copies the kext and `sysfs.fs` into place and installs the
+auto-mount **LaunchDaemon** (`com.beako.sysfs`): a system daemon that, at boot,
+runs `/usr/local/sbin/mount-sysfs` — which loads the kext if needed and mounts
+sysfs at `/sys`. Because `/sys` lives on the read-only system volume, the install
+also adds `sys` to `/etc/synthetic.conf` so the mount point is created at boot.
+
+Mounting `/sys` needs root, so this is a system LaunchDaemon, not a per-user
+login agent (mirroring how the procfs sibling mounts `/proc`). To avoid a fault
+in the kernel code boot-looping the machine, auto-mount stays **disarmed** until
+you create the arm flag — exactly like procfs's `/var/db/procfs.enabled`:
+
+```bash
+sudo make install               # installs kext, fs, and the auto-mount daemon
+sudo touch /var/db/sysfs.enabled # arm auto-mount (one time)
+sudo reboot                      # /sys is created, kext loads, sysfs mounts
+```
+
+`rm /var/db/sysfs.enabled` disables auto-mount again; `sudo make uninstall`
+removes the daemon, the `sys` synthetic entry, and unmounts `/sys`.
 
 ## Credits
 

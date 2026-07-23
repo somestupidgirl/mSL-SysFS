@@ -1,0 +1,59 @@
+#!/bin/sh
+#
+# mount-sysfs - boot-time mounter for the sysfs filesystem at /sys.
+#
+# Run by the com.beako.sysfs LaunchDaemon at boot (RunAtLoad). It loads the sysfs
+# kext if the VFS is not registered yet, waits for the /sys mount point (created
+# on the read-only system volume via /etc/synthetic.conf) and mounts sysfs there.
+#
+# Auto-mount is gated behind an arm flag so a fault in the (kernel) sysfs code
+# cannot boot-loop the machine: nothing happens until an operator runs
+#     sudo touch /var/db/sysfs.enabled
+# Remove that file to disable auto-mount again. This mirrors the procfs sibling's
+# /var/db/procfs.enabled gate.
+#
+set -u
+
+ARM_FLAG="/var/db/sysfs.enabled"
+KEXT="/Library/Extensions/sysfs.kext"
+BUNDLE_ID="com.beako.filesystems.sysfs"
+MOUNT_SYSFS="/Library/Filesystems/sysfs.fs/Contents/Resources/mount_sysfs"
+MP="/sys"
+TRIES=30
+
+log() { echo "mount-sysfs: $*"; }
+
+if [ ! -e "$ARM_FLAG" ]; then
+    log "disarmed ($ARM_FLAG absent); not mounting. Arm with: sudo touch $ARM_FLAG"
+    exit 0
+fi
+
+# Load the kext by path if it is not already loaded. Loading by path (not bundle
+# id) is the reliable route at boot; it is harmless if the VFS is already up.
+if ! kmutil showloaded 2>/dev/null | grep -q "$BUNDLE_ID"; then
+    log "loading kext $KEXT"
+    kmutil load -p "$KEXT" 2>&1 ||
+        log "kmutil load reported an error (the kext may need approval in System Settings)"
+fi
+
+# Wait for the mount point and mount. /sys is created at boot from
+# synthetic.conf; retry briefly in case this daemon runs before that appears or
+# before the kext has finished loading.
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+    if mount | grep -q " on $MP "; then
+        log "already mounted at $MP"
+        exit 0
+    fi
+    if [ -d "$MP" ] && [ -x "$MOUNT_SYSFS" ]; then
+        if "$MOUNT_SYSFS" sysfs "$MP" 2>&1; then
+            log "mounted sysfs at $MP"
+            exit 0
+        fi
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+
+log "gave up mounting sysfs at $MP after ${i}s"
+exit 1
