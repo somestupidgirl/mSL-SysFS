@@ -195,7 +195,12 @@ release: $(KEXTBUNDLE)
 load: $(KEXTBUNDLE)
 	sudo chown -R root:wheel $<
 	sudo sync
-	sudo kextutil $<
+	@# kextutil must be root-owned to load, but it fails when the kext still needs
+	@# approval (System Settings). The `-` keeps that failure from aborting the
+	@# recipe, so ownership is ALWAYS restored below - otherwise a root-owned
+	@# bundle is left behind and the next build fails writing into it ("Permission
+	@# denied" on Info.plist / the Mach-O).
+	-sudo kextutil $<
 	sudo chown -R '$(USER):$(shell id -gn)' $<
 	sudo dmesg | grep $(KEXTNAME) | tail -1
 

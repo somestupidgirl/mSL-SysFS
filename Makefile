@@ -150,7 +150,11 @@ install:
 	sudo cp -r "$(OUT)/sysfs.fs" "$(FS_DIR)/sysfs.fs"
 	sudo chmod -R 755 "$(FS_DIR)/sysfs.fs"
 	sudo chown -R root:wheel "$(FS_DIR)/sysfs.fs"
-	$(MAKE) install-daemon
+	@echo "sysfs: installed the kext and mount bundle. Boot auto-mount is NOT"
+	@echo "sysfs: installed by this target - it can hang login if the filesystem"
+	@echo "sysfs: is not yet safe to mount at boot. Enable it separately, only"
+	@echo "sysfs: after testing the mount while logged in, with:"
+	@echo "         sudo make install-daemon && sudo touch $(ARM_FLAG)"
 
 # The auto-mount LaunchDaemon: the mount-sysfs script + its plist, plus the
 # /sys mount point (created on the read-only system volume via synthetic.conf).

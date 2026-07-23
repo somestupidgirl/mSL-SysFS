@@ -18,6 +18,7 @@
 #include <sys/mount.h>
 
 #include <fs/sysfs/sysfs.h>
+#include <fs/sysfs/sysfs_iokit.h>
 
 #pragma mark -
 #pragma mark External References
@@ -122,10 +123,10 @@ sysfs_start(kmod_info_t *ki, __unused void *d)
     os_log(OS_LOG_DEFAULT, "%s file system registered", sysfs_vfsentry.vfe_fsname);
 
     /*
-     * The sysfsd kernel-control bridge and the presentation-mode sysctl are
-     * later passes (they arrive with the IORegistry-backed content that needs
-     * them). Nothing to register here in the scaffold.
+     * Bring up the IOKit snapshot machinery (the lock; the snapshot itself is
+     * built lazily on first use). Must happen before any mount.
      */
+    sysfs_iokit_init();
 
     os_log(OS_LOG_DEFAULT, "loaded %s version %s build %s (%s) \n",
         BUNDLEID_S, KEXTVERSION_S, KEXTBUILD_S, __TS__);
@@ -152,6 +153,12 @@ sysfs_stop(__unused kmod_info_t *ki, __unused void *d)
             return KERN_FAILURE;
         }
     }
+
+    /*
+     * Release the IOKit snapshot and its lock (after the fs is unregistered, so
+     * no more fs ops can reach it).
+     */
+    sysfs_iokit_teardown();
 
     sysfs_fini();
     libkext_massert();

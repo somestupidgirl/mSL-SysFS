@@ -2,9 +2,12 @@
 #
 # mount-sysfs - boot-time mounter for the sysfs filesystem at /sys.
 #
-# Run by the com.beako.sysfs LaunchDaemon at boot (RunAtLoad). It loads the sysfs
-# kext if the VFS is not registered yet, waits for the /sys mount point (created
-# on the read-only system volume via /etc/synthetic.conf) and mounts sysfs there.
+# Run by the com.beako.sysfs LaunchDaemon at boot (RunAtLoad). Unlike the procfs
+# sibling's always-running daemon, this is a one-shot: it must therefore LOAD the
+# sysfs kext itself and CONFIRM it is loaded (the VFS registered) before it tries
+# to mount - the sysfs kext does not stay loaded across reboots on its own. Only
+# once the kext is confirmed loaded does it wait for the /sys mount point (created
+# on the read-only system volume via /etc/synthetic.conf) and mount sysfs there.
 #
 # Auto-mount is gated behind an arm flag so a fault in the (kernel) sysfs code
 # cannot boot-loop the machine: nothing happens until an operator runs
@@ -23,22 +26,71 @@ TRIES=30
 
 log() { echo "mount-sysfs: $*"; }
 
+kext_loaded() {
+    kmutil showloaded 2>/dev/null | grep -q "$BUNDLE_ID"
+}
+
 if [ ! -e "$ARM_FLAG" ]; then
     log "disarmed ($ARM_FLAG absent); not mounting. Arm with: sudo touch $ARM_FLAG"
     exit 0
 fi
 
-# Load the kext by path if it is not already loaded. Loading by path (not bundle
-# id) is the reliable route at boot; it is harmless if the VFS is already up.
-if ! kmutil showloaded 2>/dev/null | grep -q "$BUNDLE_ID"; then
-    log "loading kext $KEXT"
-    kmutil load -p "$KEXT" 2>&1 ||
-        log "kmutil load reported an error (the kext may need approval in System Settings)"
-fi
+# --- Phase 1: load the kext, and do not proceed until it is actually loaded. ---
+#
+# The mount(2) for "sysfs" fails outright until the kext has registered the VFS,
+# so mounting before the load has taken effect is pointless. Load by path (not
+# bundle id) - the reliable route at boot - and poll until the kext shows up in
+# kmutil showloaded, retrying the load in case kernelmanagement was not ready on
+# the first attempt.
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+    if kext_loaded; then
+        break
+    fi
+    log "loading kext $KEXT (attempt $((i + 1)))"
+    out=$(kmutil load -p "$KEXT" 2>&1)
+    [ -n "$out" ] && log "kmutil load: $out"
+    kext_loaded && break
+    i=$((i + 1))
+    sleep 1
+done
 
-# Wait for the mount point and mount. /sys is created at boot from
-# synthetic.conf; retry briefly in case this daemon runs before that appears or
-# before the kext has finished loading.
+if ! kext_loaded; then
+    log "kext did not load after ${TRIES}s; NOT mounting (needs approval in"
+    log "System Settings > Privacy & Security, or a rebuilt/installed kext)."
+    exit 1
+fi
+log "kext loaded; VFS registered"
+
+# --- Phase 1.5: wait for a console login before mounting. ---
+#
+# Mounting /sys during the early-boot window - while loginwindow/coreservicesd
+# build the initial File Manager volume "universe" - hangs coreservicesd and
+# black-screens login (loginwindow aborts, unable to check in). A /sys mount at
+# a LATER login (the console user has logged in; lock/unlock; manual mount) is
+# fine. So we wait until a real user owns the console, which means loginwindow's
+# fragile init has already completed without /sys present, then mount.
+log "waiting for console login before mounting"
+i=0
+while [ "$i" -lt 300 ]; do          # up to ~10 min
+    user=$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null)   # absolute path: BSD stat, PATH-proof
+    case "$user" in
+        ""|root|_*|loginwindow)
+            ;;                       # loginwindow / system owner - not logged in yet
+        *)
+            log "console user '$user' logged in"
+            break
+            ;;
+    esac
+    i=$((i + 1))
+    sleep 2
+done
+sleep 3                             # small settle so the session is fully established
+
+# --- Phase 2: mount, now that a user is logged in and the kext is loaded. ---
+#
+# /sys is created at boot from synthetic.conf; retry briefly in case it is not
+# yet present.
 i=0
 while [ "$i" -lt "$TRIES" ]; do
     if mount | grep -q " on $MP "; then
@@ -46,10 +98,12 @@ while [ "$i" -lt "$TRIES" ]; do
         exit 0
     fi
     if [ -d "$MP" ] && [ -x "$MOUNT_SYSFS" ]; then
-        if "$MOUNT_SYSFS" sysfs "$MP" 2>&1; then
+        out=$("$MOUNT_SYSFS" sysfs "$MP" 2>&1)
+        if [ $? -eq 0 ]; then
             log "mounted sysfs at $MP"
             exit 0
         fi
+        [ -n "$out" ] && log "mount_sysfs: $out"
     fi
     i=$((i + 1))
     sleep 1

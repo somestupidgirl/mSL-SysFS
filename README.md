@@ -171,25 +171,40 @@ sudo make -C kext unload
 
 ### Auto-mounting at boot
 
-`sudo make install` copies the kext and `sysfs.fs` into place and installs the
-auto-mount **LaunchDaemon** (`com.beako.sysfs`): a system daemon that, at boot,
-runs `/usr/local/sbin/mount-sysfs` — which loads the kext if needed and mounts
-sysfs at `/sys`. Because `/sys` lives on the read-only system volume, the install
-also adds `sys` to `/etc/synthetic.conf` so the mount point is created at boot.
-
-Mounting `/sys` needs root, so this is a system LaunchDaemon, not a per-user
-login agent (mirroring how the procfs sibling mounts `/proc`). To avoid a fault
-in the kernel code boot-looping the machine, auto-mount stays **disarmed** until
-you create the arm flag — exactly like procfs's `/var/db/procfs.enabled`:
+`sudo make install` installs **only** the kext and `sysfs.fs` — it does **not**
+touch boot. Boot auto-mount is a separate, opt-in step, because mounting `/sys`
+at boot can hang login if the filesystem isn't yet safe to expose to the system's
+volume scanners (see the note below):
 
 ```bash
-sudo make install               # installs kext, fs, and the auto-mount daemon
-sudo touch /var/db/sysfs.enabled # arm auto-mount (one time)
+sudo make install         # kext + mount bundle only (never affects boot)
+```
+
+To enable boot auto-mount, install the LaunchDaemon (`com.beako.sysfs`): a system
+daemon that at boot runs `/usr/local/sbin/mount-sysfs`, which loads the kext and
+mounts sysfs at `/sys`. Because `/sys` is on the read-only system volume, this
+also adds `sys` to `/etc/synthetic.conf` so the mount point is created at boot.
+Mounting `/sys` needs root, so it is a system LaunchDaemon, not a per-user login
+agent (mirroring how procfs mounts `/proc`). It stays **disarmed** until you
+create the arm flag (like procfs's `/var/db/procfs.enabled`), so a fault in the
+kernel code cannot boot-loop the machine:
+
+```bash
+# Only after verifying the mount is safe while logged in (see below):
+sudo make install-daemon         # install the auto-mount LaunchDaemon
+sudo touch /var/db/sysfs.enabled # arm it (one time)
 sudo reboot                      # /sys is created, kext loads, sysfs mounts
 ```
 
-`rm /var/db/sysfs.enabled` disables auto-mount again; `sudo make uninstall`
-removes the daemon, the `sys` synthetic entry, and unmounts `/sys`.
+`rm /var/db/sysfs.enabled` disarms it again; `sudo make uninstall` removes the
+daemon, the `sys` synthetic entry, unmounts `/sys`, and removes the kext/fs.
+
+> **Why the caution:** `/sys/devices` is a deep, live IORegistry tree. If the
+> volume is browsable, Spotlight indexes it and the recursive walk can hang
+> `coreservicesd` and break login. The mount is marked `MNT_DONTBROWSE` to keep
+> it out of the browse/index path (as devfs is), but verify a manual mount is
+> safe — `mount | grep sysfs` shows `nobrowse`, and locking/​switching users and
+> logging back in works — before arming boot auto-mount.
 
 ## Credits
 

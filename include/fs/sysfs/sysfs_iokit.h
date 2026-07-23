@@ -25,6 +25,15 @@ extern "C" {
 #endif
 
 /*
+ * Allocate / free the IOKit snapshot machinery. sysfs_iokit_init() is called
+ * once from the kext start routine (before any mount), sysfs_iokit_teardown()
+ * from the stop routine (after the last unmount) to release the snapshot and its
+ * lock.
+ */
+void sysfs_iokit_init(void);
+void sysfs_iokit_teardown(void);
+
+/*
  * 1 if a registry entry with this id currently exists (id 0, the devices root,
  * is always present).
  */
