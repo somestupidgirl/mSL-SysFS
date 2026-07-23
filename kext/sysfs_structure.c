@@ -113,7 +113,15 @@ sysfs_structure_init(void)
         (void)add_directory(dev_dir, "char",  SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(dev_dir, "block", SFSdir, next_node_id++, 0, 0, NULL, NULL);
 
-        (void)add_directory(root_node, "devices",    SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        /*
+         * /sys/devices - the IORegistry mirror. A single SFSdevice node backs the
+         * whole subtree; which registry entry a given directory stands for is
+         * carried per-vnode in the node id's regid (0 == the registry root ==
+         * this directory itself). Added with add_node (not add_directory) so it
+         * has no static "."/".." children - the dynamic readdir emits those
+         * itself (see sysfs_devices_readdir), exactly as procfs does for /proc/sys.
+         */
+        (void)add_node(root_node, "devices", SFSdevice, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
         (void)add_directory(root_node, "firmware",   SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "fs",         SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "hypervisor", SFSdir, next_node_id++, 0, 0, NULL, NULL);

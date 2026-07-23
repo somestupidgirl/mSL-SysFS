@@ -105,6 +105,18 @@ CFLAGS+= -Werror -Wall -Wextra \
          -Wno-unused-function \
          -Wno-deprecated-declarations
 
+# C++ flags for the IOKit translation unit (sysfs_iokit.cpp). Reuse the C flags
+# but: drop the C-language selector (-x c / -std=gnu99); drop the vendored XNU
+# header paths (they are C-only - _Bool, C-linkage prototypes - and clash with
+# C++; the IOKit/libkern C++ headers come from the SDK Kernel.framework via the
+# -isystem $(KERNEL_HEADERS) already in CFLAGS); and add the kernel C++ dialect
+# (no RTTI/exceptions - libkern has its own via OSMetaClass - and -fapple-kext
+# for the kext C++ ABI). No MacKernelSDK: the C++ runtime symbols (OSObject,
+# operator new, __cxa_*) resolve at load against com.apple.kpi.libkern/iokit,
+# so only the plain macOS SDK is needed.
+CXXFLAGS := $(filter-out -x c -std=gnu99 $(XNU_INCLUDES),$(CFLAGS)) \
+            -x c++ -std=gnu++17 -fno-rtti -fno-exceptions -fapple-kext
+
 LDFLAGS+= -target $(TARGET_TRIPLE) \
           -isysroot $(SDKROOT) \
           $(ARCHFLAGS) \
@@ -132,6 +144,9 @@ all: debug
 
 %.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.cpp $(HDRS)
+	$(CC) $(CXXFLAGS) -c -o $@ $<
 
 $(KEXTMACHO): $(OBJS)
 	$(CC) $(LDFLAGS) $(LIBS) -o $@ $^

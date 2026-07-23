@@ -14,12 +14,12 @@ Linux-compatible sysfs layout.
 
 One module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
-> **Status: scaffold.** This repository currently contains the project skeleton
-> and the core filesystem infrastructure only. `/sys` **mounts as an essentially
-> empty filesystem** — the root plus the fixed Linux `/sys` top-level directories
-> — and the build/load/mount flow works. All *content* (device attributes, the
-> symlink views, the `sysfsd` daemon, IOKit enumeration) is not implemented yet.
-> See [Feature status](#feature-status).
+> **Status: early.** `/sys` mounts, and **`/sys/devices` now mirrors the IOKit
+> registry** — every registry entry appears as a directory (recursively, keyed by
+> `IORegistryEntryID`) with a readable `name` attribute, walked in-kernel with no
+> daemon. The other top-level directories (`class/`, `bus/`, `block/`, `dev/`,
+> `module/`, `kernel/`, …) are still the empty skeleton, and per-device attributes
+> beyond `name` are not enumerated yet. See [Feature status](#feature-status).
 
 ## The larger project
 
@@ -76,12 +76,15 @@ The core of SysFS (in the passes that follow this scaffold) is:
 | `power/`   | system power-management state |
 | `hypervisor/` | hypervisor interface (empty when not running under one) |
 
-As in the procfs sibling, IOKit is C++/registry territory that a kext reaches
-awkwardly and that PAC/SIP restrict, so the plan is a **`sysfsd` userspace
-daemon** plus a C++ IOKit translation unit (`sysfs_iokit.cpp`) — mirroring
-`procfsd` / `procfs_iokit.cpp` — feeding the kext the registry snapshot it
-formats into nodes. Anything unreachable degrades gracefully (empty directory /
-`ENOTSUP`) rather than failing the mount.
+IOKit registry traversal, entry ids and property reads are all *public in-kernel
+KPI* (`com.apple.kpi.iokit`), so — unlike the procfs sibling, whose daemon exists
+for `task_for_pid`/VM introspection that genuinely can't be done in-kernel —
+SysFS walks the registry **directly in the kext**, with no `sysfsd` daemon. This
+lives in one C++ translation unit (`kext/sysfs_iokit.cpp`) exposing a small
+`extern "C"` surface to the C filesystem code; it builds against the **plain
+macOS SDK only** (no MacKernelSDK — the C++ runtime symbols resolve at load
+against `com.apple.kpi.libkern`). Anything unreachable degrades gracefully
+(empty directory) rather than failing the mount.
 
 The node model already reflects this: a sysfs node's identity
 (`struct sfsid`, `include/fs/sysfs/sysfs.h`) is keyed on the backing
@@ -98,29 +101,34 @@ core.
     root, returning the fixed Linux `/sys` top-level directories:
     `block bus class dev devices firmware fs hypervisor kernel module power`
     (and `dev/char`, `dev/block`).
-  - `stat(2)` on every skeleton node (world-readable, root-owned: directories
-    `0555`, files `0444`).
+  - `stat(2)` on every node (world-readable, root-owned: directories `0555`,
+    files `0444`).
+  - **`/sys/devices` mirrors the IOKit registry**: an in-kernel C++ IOKit
+    translation unit walks `gIOServicePlane`, so each registry entry appears as a
+    directory (recursively, keyed by `IORegistryEntryID`, named by its IOKit
+    name with sibling-collision suffixes) with a readable `name` attribute file.
   - Clean unmount and kext unload (no leaked vnodes).
 
 **Planned (not yet implemented):**
 
-  - The `sysfsd` daemon and its kernel-control wire protocol.
-  - The IOKit translation unit and the `/sys/devices` registry mirror.
-  - The `class/`, `bus/`, `block/`, `dev/` symlink views.
+  - Full IOKit property → attribute enumeration (beyond `name`).
+  - The `class/`, `bus/`, `block/`, `dev/` symlink views into `devices/`.
   - `module/`, `kernel/`, `firmware/`, `fs/`, `power/` content.
   - GUI / preference pane, installer package, and the test suite.
 
 ## Repository layout
 
 ```
-include/fs/sysfs/sysfs.h   shared node model (kernel + future daemon)
+include/fs/sysfs/sysfs.h       shared node model
+include/fs/sysfs/sysfs_iokit.h C surface of the IOKit translation unit
 kext/                      the kernel extension
   sysfs.c                    kmod start/stop, init/fini
   sysfs_vfsops.c             VFS ops: mount/unmount/root/getattr
   sysfs_vnops.c              vnode ops: lookup/readdir/getattr/read/reclaim
   sysfs_node.c               sfsnode hash table + find/create
-  sysfs_structure.c          the static /sys skeleton tree
+  sysfs_structure.c          the /sys skeleton tree (+ the devices node)
   sysfs_subr.c               generic helpers (allocvp, fileid, sizes)
+  sysfs_iokit.cpp            in-kernel IORegistry walk (the one C++ TU)
 fs/                        the mount bundle (sysfs.fs) + mount_sysfs
 lib/                       vendored libraries (git submodules)
 include/xnu/               vendored XNU private headers

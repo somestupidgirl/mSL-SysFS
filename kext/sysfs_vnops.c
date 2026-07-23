@@ -26,6 +26,7 @@
 #include <vfs/vfs_support.h>
 
 #include <fs/sysfs/sysfs.h>
+#include <fs/sysfs/sysfs_iokit.h>
 
 #pragma mark -
 #pragma mark Local Definitions
@@ -55,13 +56,50 @@
  * corresponding to a sfsnode_t.
  */
 typedef struct {
-    vnode_t vca_parentvp; // Parent vnode.
+    vnode_t vca_parentvp; // Parent vnode (may be NULLVP, e.g. for "..").
+    mount_t vca_mp;       // Owning mount (never NULL; the parent vnode can be).
 } sysfs_vnode_create_args;
 
 /*
  * Size of a buffer large enough to hold any structure-node name.
  */
 static const int NAME_BUFFER_SIZE = MAX_STRUCT_NODE_NAME_LEN;
+
+/*
+ * /sys/devices dynamic nodes (SFSdevice).
+ *
+ * A single SFSdevice structure node backs every directory under /sys/devices;
+ * which registry entry a given node is stands in nodeid_regid (0 == the devices
+ * root == the IORegistry root). nodeid_objectid then selects what the node is:
+ * 0 is the device directory itself, and a non-zero value names one of the
+ * directory's attribute files (see sysfs_dev_attrs). This mirrors how the procfs
+ * sibling backs all of /proc/sys with one shared PFSsysctl node keyed by oid.
+ */
+#define SYSFS_DEV_DIR_OBJID   ((uint64_t)0)   /* the device directory */
+#define SYSFS_DEV_ATTR_NAME   ((uint64_t)1)   /* the "name" file */
+
+/* Upper bound on an attribute file's value (IOKit names are well under this). */
+#define SYSFS_ATTR_VALUE_MAX  256
+
+static inline boolean_t
+sysfs_dev_is_dir(uint64_t objectid)
+{
+    return objectid == SYSFS_DEV_DIR_OBJID;
+}
+
+/*
+ * The attribute files every /sys/devices entry exposes. Slice 1 exposes just
+ * "name" (the IOKit entry name); kept as a table so more IOKit properties slot
+ * in without touching the readdir/lookup logic.
+ */
+struct sysfs_dev_attr {
+    const char *name;
+    uint64_t    objid;
+};
+static const struct sysfs_dev_attr sysfs_dev_attrs[] = {
+    { "name", SYSFS_DEV_ATTR_NAME },
+};
+#define SYSFS_DEV_NATTRS ((int)(sizeof(sysfs_dev_attrs) / sizeof(sysfs_dev_attrs[0])))
 
 #pragma mark -
 #pragma mark Function Prototypes
@@ -82,6 +120,9 @@ STATIC int sysfs_vnop_inactive(struct vnop_inactive_args *ap);
 STATIC inline int sysfs_calc_dirent_size(const char *name);
 STATIC int sysfs_copyout_dirent(int type, uint64_t file_id, const char *name, uio_t uio, int *sizep, off_t seekoff);
 STATIC int sysfs_create_vnode(sysfs_vnode_create_args *cap, sfsnode_t *snp, vnode_t *vpp);
+STATIC int sysfs_devices_readdir(struct vnop_readdir_args *ap);
+STATIC int sysfs_device_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio);
+STATIC size_t sysfs_device_attr_size(sfsnode_t *snp);
 
 #pragma mark -
 #pragma mark Vnode Operations Structures
@@ -242,16 +283,36 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
          * what its node id would be.
          */
         sfsid_t parent_node_id;
-        sysfs_get_parent_node_id(dir_snp, &parent_node_id);
-        sfssnode_t *parent_snode = dir_snp->node_structure_node->ssn_parent;
-        if (parent_snode == NULL) {
-            parent_snode = dir_snp->node_structure_node;    /* root is its own parent */
+        sfssnode_t *dir_snode = dir_snp->node_structure_node;
+        sfssnode_t *parent_snode;
+
+        if (dir_snode->ssn_node_type == SFSdevice &&
+            dir_snp->node_id.nodeid_regid != 0) {
+            /*
+             * A nested /sys/devices directory: its parent is the enclosing
+             * registry entry (or the /sys/devices root, regid 0), backed by the
+             * same shared SFSdevice structure node - not that node's static
+             * parent (which is the /sys root).
+             */
+            uint64_t parent_regid = 0;
+            (void)sysfs_iokit_parent(dir_snp->node_id.nodeid_regid, &parent_regid);
+            parent_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
+            parent_node_id.nodeid_regid    = parent_regid;
+            parent_node_id.nodeid_objectid = SYSFS_DEV_DIR_OBJID;
+            parent_snode = dir_snode;
+        } else {
+            sysfs_get_parent_node_id(dir_snp, &parent_node_id);
+            parent_snode = dir_snode->ssn_parent;
+            if (parent_snode == NULL) {
+                parent_snode = dir_snode;    /* root is its own parent */
+            }
         }
 
         sfsnode_t *target_sfsnode;
         vnode_t target_vnode;
         sysfs_vnode_create_args create_args;
-        create_args.vca_parentvp = NULLVP;
+        create_args.vca_parentvp = NULLVP;   /* the parent of ".." is not "dvp" */
+        create_args.vca_mp = vnode_mount(dvp);
 
         error = sysfsnode_find(mp, parent_node_id,
                                parent_snode,
@@ -278,17 +339,45 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
         sfssnode_t *match_node = NULL;
         sfsid_t match_node_id = { 0 };
 
-        TAILQ_FOREACH(match_node, &dir_snode->ssn_children, ssn_next) {
-            if (strcmp(name, match_node->ssn_name) == 0) {
-                /*
-                 * Name matched. Construct the node id from the matched node and
-                 * the regid/objectid of the parent directory (both SYSFS_NO_* in
-                 * the static skeleton).
-                 */
-                match_node_id.nodeid_base_id  = match_node->ssn_base_node_id;
-                match_node_id.nodeid_regid    = dir_snp->node_id.nodeid_regid;
-                match_node_id.nodeid_objectid = dir_snp->node_id.nodeid_objectid;
-                break;
+        if (dir_snode->ssn_node_type == SFSdevice) {
+            /*
+             * /sys/devices entries are dynamic: match the name against this
+             * entry's attribute files first, then its child registry entries
+             * (via IOKit). Both reuse the single shared SFSdevice structure node,
+             * distinguished by the matched regid/objectid.
+             */
+            uint64_t regid = dir_snp->node_id.nodeid_regid;
+            for (int a = 0; a < SYSFS_DEV_NATTRS; a++) {
+                if (strcmp(name, sysfs_dev_attrs[a].name) == 0) {
+                    match_node = dir_snode;
+                    match_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = regid;
+                    match_node_id.nodeid_objectid = sysfs_dev_attrs[a].objid;
+                    break;
+                }
+            }
+            if (match_node == NULL) {
+                uint64_t child_regid = 0;
+                if (sysfs_iokit_child_named(regid, name, (size_t)cnp->cn_namelen, &child_regid)) {
+                    match_node = dir_snode;
+                    match_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = child_regid;
+                    match_node_id.nodeid_objectid = SYSFS_DEV_DIR_OBJID;
+                }
+            }
+        } else {
+            TAILQ_FOREACH(match_node, &dir_snode->ssn_children, ssn_next) {
+                if (strcmp(name, match_node->ssn_name) == 0) {
+                    /*
+                     * Name matched. Construct the node id from the matched node
+                     * and the regid/objectid of the parent directory (both
+                     * SYSFS_NO_* in the static skeleton).
+                     */
+                    match_node_id.nodeid_base_id  = match_node->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = dir_snp->node_id.nodeid_regid;
+                    match_node_id.nodeid_objectid = dir_snp->node_id.nodeid_objectid;
+                    break;
+                }
             }
         }
 
@@ -304,6 +393,7 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
             vnode_t target_vnode;
             sysfs_vnode_create_args create_args;
             create_args.vca_parentvp = dvp;
+            create_args.vca_mp = vnode_mount(dvp);
             error = sysfsnode_find(mp, match_node_id,
                                    match_node,
                                    &target_sfsnode,
@@ -345,6 +435,14 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
 
     sfsnode_t *dir_snp = VTOSFS(vp);
     sfssnode_t *dir_snode = dir_snp->node_structure_node;
+
+    /*
+     * /sys/devices directories enumerate the live IORegistry, not static
+     * children.
+     */
+    if (dir_snode->ssn_node_type == SFSdevice) {
+        return sysfs_devices_readdir(ap);
+    }
 
     int numentries = 0;
     int error = 0;
@@ -439,6 +537,86 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
 }
 
 /*
+ * Readdir for a /sys/devices directory (SFSdevice): emits "." and "..", then the
+ * entry's attribute files, then one subdirectory per child registry entry (from
+ * IOKit). Mirrors the offset/EOF accounting of the main readdir - start from the
+ * first entry each call, only copy entries at/after the caller's offset - so a
+ * directory that overflows one buffer resumes correctly on the next call.
+ */
+STATIC int
+sysfs_devices_readdir(struct vnop_readdir_args *ap)
+{
+    sfsnode_t  *dir_snp = VTOSFS(ap->a_vp);
+    uio_t       uio      = ap->a_uio;
+    off_t       startpos = uio_offset(uio);
+    off_t       nextpos  = 0;
+    int         numentries = 0;
+    int         error    = 0;
+
+    uint64_t    regid       = dir_snp->node_id.nodeid_regid;
+    sfsbaseid_t base        = dir_snp->node_structure_node->ssn_base_node_id;
+    uint64_t    self_fileid = sysfs_get_node_fileid(dir_snp);
+    boolean_t   exhausted   = FALSE;
+
+    /* "." and ".." */
+    const char *dots[2] = { ".", ".." };
+    for (int d = 0; d < 2; d++) {
+        int size = sysfs_calc_dirent_size(dots[d]);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_DIR, self_fileid, dots[d], uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                goto done;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+    /* Attribute files (name, ...). */
+    for (int a = 0; a < SYSFS_DEV_NATTRS && uio_resid(uio) > 0; a++) {
+        const char *nm = sysfs_dev_attrs[a].name;
+        int size = sysfs_calc_dirent_size(nm);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_REG,
+                        sysfs_get_fileid(regid, sysfs_dev_attrs[a].objid, base),
+                        nm, uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                goto done;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+    /* Child registry entries, one subdirectory each. */
+    for (unsigned int i = 0; error == 0 && uio_resid(uio) > 0; i++) {
+        char     childname[NAME_MAX + 1];
+        uint64_t child_regid = 0;
+        if (!sysfs_iokit_child_at(regid, i, childname, sizeof(childname), &child_regid)) {
+            exhausted = TRUE;   /* past the last child */
+            break;
+        }
+        int size = sysfs_calc_dirent_size(childname);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_DIR,
+                        sysfs_get_fileid(child_regid, SYSFS_DEV_DIR_OBJID, base),
+                        childname, uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                break;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+done:
+    uio_setoffset(uio, nextpos);
+    *ap->a_eofflag   = (error == 0 && exhausted) ? 1 : 0;
+    *ap->a_numdirent = numentries;
+    return error;
+}
+
+/*
  * Calculates the packed size for a directory entry for a given file name. The
  * size is the sum of the fixed part of the dirent structure plus the space
  * required for the null-terminated name, rounded up to a multiple of 8 bytes
@@ -499,26 +677,35 @@ sysfs_vnop_getattr(struct vnop_getattr_args *ap)
     struct vnode_attr *vap = ap->a_vap;
 
     /*
-     * Mode from the node type.
+     * Type, mode and size. A /sys/devices node (SFSdevice) is a directory or an
+     * attribute file depending on the objectid carried in its node id, so those
+     * three are decided together; every other node type is fixed by its
+     * structure type.
      */
+    enum vtype vtype;
     mode_t mode;
-    if (node_type == SFSlink) {
-        mode = ALL_ACCESS_ALL;                  /* target decides real access */
-    } else if (sysfs_is_directory_type(node_type)) {
-        mode = READ_EXECUTE_ALL;                /* 0555 */
+    size_t size;
+    if (node_type == SFSdevice) {
+        boolean_t isdir = sysfs_dev_is_dir(sysfs_node->node_id.nodeid_objectid);
+        vtype = isdir ? VDIR : VREG;
+        mode  = isdir ? READ_EXECUTE_ALL : READ_ALL;
+        size  = isdir ? 0 : sysfs_device_attr_size(sysfs_node);
     } else {
-        mode = READ_ALL;                        /* 0444 */
+        vtype = sysfs_allocvp(node_type);
+        if (node_type == SFSlink) {
+            mode = ALL_ACCESS_ALL;              /* target decides real access */
+        } else if (sysfs_is_directory_type(node_type)) {
+            mode = READ_EXECUTE_ALL;            /* 0555 */
+        } else {
+            mode = READ_ALL;                    /* 0444 */
+        }
+        size = sysfs_get_node_size_attr(sysfs_node, vfs_context_ucred(ap->a_context));
     }
     VATTR_RETURN(vap, va_mode, mode);
-
-    /*
-     * Generic attributes.
-     */
-    VATTR_RETURN(vap, va_type, sysfs_allocvp(node_type));                    /* File type */
-    VATTR_RETURN(vap, va_fsid, pmp->pmnt_id);                               /* File system id */
-    VATTR_RETURN(vap, va_fileid, sysfs_get_node_fileid(sysfs_node));        /* Unique file id */
-    VATTR_RETURN(vap, va_data_size,
-        sysfs_get_node_size_attr(sysfs_node, vfs_context_ucred(ap->a_context)));  /* File size */
+    VATTR_RETURN(vap, va_type, vtype);                              /* File type */
+    VATTR_RETURN(vap, va_fsid, pmp->pmnt_id);                       /* File system id */
+    VATTR_RETURN(vap, va_fileid, sysfs_get_node_fileid(sysfs_node));/* Unique file id */
+    VATTR_RETURN(vap, va_data_size, size);                          /* File size */
 
     /*
      * These files are generated on read, so a live timestamp is more meaningful
@@ -577,6 +764,19 @@ sysfs_vnop_read(struct vnop_read_args *ap)
     sfssnode_t *snode = snp->node_structure_node;
     sysfs_read_data_fn read_data_fn = snode->ssn_read_data_fn;
 
+    /*
+     * /sys/devices nodes have no static read fn: a device directory reads as
+     * EISDIR, an attribute file reads its value from IOKit (the objectid selects
+     * which attribute).
+     */
+    if (snode->ssn_node_type == SFSdevice) {
+        uint64_t objid = snp->node_id.nodeid_objectid;
+        if (sysfs_dev_is_dir(objid)) {
+            return EISDIR;
+        }
+        return sysfs_device_read_attr(snp, objid, ap->a_uio);
+    }
+
     int error = EINVAL;
     if (sysfs_is_directory_type(snode->ssn_node_type)) {
         error = EISDIR;
@@ -584,6 +784,45 @@ sysfs_vnop_read(struct vnop_read_args *ap)
         error = read_data_fn(snp, ap->a_uio, ap->a_context);
     }
     return error;
+}
+
+/*
+ * Reads a /sys/devices attribute file's value into the uio. Slice 1 supports the
+ * "name" attribute (the IOKit entry name); the value is the name plus a trailing
+ * newline, as Linux sysfs attribute files end in "\n". If the entry has gone
+ * (removed since lookup), the value is an empty line.
+ */
+STATIC int
+sysfs_device_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio)
+{
+    uint64_t regid = snp->node_id.nodeid_regid;
+
+    if (objid == SYSFS_DEV_ATTR_NAME) {
+        char buf[SYSFS_ATTR_VALUE_MAX];
+        size_t n = sysfs_iokit_name(regid, buf, sizeof(buf) - 1);
+        buf[n] = '\n';
+        buf[n + 1] = '\0';
+        return sysfs_copy_data(buf, (int)(n + 1), uio);
+    }
+    return EINVAL;
+}
+
+/*
+ * The size an attribute file reports to stat(2): the length of the value that
+ * sysfs_device_read_attr would return (value + trailing newline).
+ */
+STATIC size_t
+sysfs_device_attr_size(sfsnode_t *snp)
+{
+    uint64_t regid = snp->node_id.nodeid_regid;
+    uint64_t objid = snp->node_id.nodeid_objectid;
+
+    if (objid == SYSFS_DEV_ATTR_NAME) {
+        char buf[SYSFS_ATTR_VALUE_MAX];
+        size_t n = sysfs_iokit_name(regid, buf, sizeof(buf) - 1);
+        return n + 1;   /* trailing newline */
+    }
+    return 0;
 }
 
 /*
@@ -642,8 +881,20 @@ sysfs_create_vnode(sysfs_vnode_create_args *cap, sfsnode_t *snp, vnode_t *vpp)
     struct vnode_fsparam vnode_create_params;
 
     memset(&vnode_create_params, 0, sizeof(vnode_create_params));
-    vnode_create_params.vnfs_mp = vnode_mount(cap->vca_parentvp);
-    vnode_create_params.vnfs_vtype = sysfs_allocvp(snode->ssn_node_type);
+    /*
+     * Take the mount from vca_mp, not vnode_mount(vca_parentvp): the parent
+     * vnode is NULLVP on the ".." path (its target is not "dvp"), and a deep
+     * /sys/devices tree makes a ".." whose parent is not cached reachable
+     * (e.g. an openat("..") on a fd whose parent was reclaimed).
+     */
+    vnode_create_params.vnfs_mp = cap->vca_mp;
+    /*
+     * /sys/devices nodes are directories or attribute files depending on the
+     * objectid carried in the node id, not on the structure type alone.
+     */
+    vnode_create_params.vnfs_vtype = (snode->ssn_node_type == SFSdevice)
+        ? (sysfs_dev_is_dir(snp->node_id.nodeid_objectid) ? VDIR : VREG)
+        : sysfs_allocvp(snode->ssn_node_type);
     vnode_create_params.vnfs_str = "sysfs vnode";
     vnode_create_params.vnfs_dvp = cap->vca_parentvp;
     vnode_create_params.vnfs_fsnode = snp;
