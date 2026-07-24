@@ -242,6 +242,7 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
                  */
                 lck_mtx_lock(sfsnode_hash_mutex);
                 target_sfsnode = NULL;
+                OSFree(new_sfsnode, sizeof(sfsnode_t), sysfs_osmalloc_tag);
                 new_sfsnode = NULL;
                 locked = TRUE;
                 continue;
