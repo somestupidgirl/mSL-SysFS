@@ -162,15 +162,27 @@ sysfs_copy_data(const char *data, int data_len, uio_t uio)
 {
     int error = 0;
 
-    off_t start_offset = uio_offset(uio);
-    data_len -= start_offset;
+    if (data == NULL) {
+        return EFAULT;
+    }
 
-    if ((data_len >= 0) && (data != NULL)) {
-        error = uiomove(data + start_offset, data_len, uio);
-    } else if ((data_len >= 0) && (data == NULL)) {
+    off_t start_offset = uio_offset(uio);
+    if (start_offset >= data_len) {
+        /* Nothing to copy */
+        return error;
+    }
+
+    int len = data_len - (int)start_offset;
+    if (len < 0) {
+        return EINVAL;
+    }
+
+    if ((len >= 0) && (data != NULL)) {
+        error = uiomove(data + start_offset, len, uio);
+    } else if ((len >= 0) && (data == NULL)) {
         error = EFAULT;
-    } else if ((data_len <= 0) && (data != NULL)) {
-        error = EIO;
+    } else if ((len <= 0) && (data != NULL)) {
+        error = EINVAL;
     } else {
         error = ENOTSUP;
     }
