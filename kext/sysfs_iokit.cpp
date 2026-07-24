@@ -304,6 +304,9 @@ sysfs_snap_ensure(void)
     uint64_t now, elapsed_ns;
     clock_get_uptime(&now);
 
+    struct sysfs_snapshot *old_snap = nullptr;
+    struct sysfs_snapshot *new_snap = nullptr;
+
     /* Fast check under lock */
     if (g_lock != nullptr) {
         IOLockLock(g_lock);
@@ -318,30 +321,35 @@ sysfs_snap_ensure(void)
     }
 
     /* Build new snapshot UNLOCKED (heavy IOKit traversal & IOMalloc happen here) */
-    struct sysfs_snapshot *new_snap = sysfs_snap_build();
+    new_snap = sysfs_snap_build();
     if (new_snap == nullptr) {
         return;
     }
 
     /* Re-acquire lock to swap pointers safely */
-    struct sysfs_snapshot *old_snap = nullptr;
     if (g_lock != nullptr) {
         IOLockLock(g_lock);
         if (g_snapshot != nullptr) {
             absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
             if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
-                /* Another thread refreshed it while unlocked; throw away our snapshot */
+                /* Another thread refreshed it while unlocked */
+                /* Throw away our snapshot, keep theirs */
                 old_snap = new_snap;
+                new_snap = nullptr;
             } else {
                 old_snap = g_snapshot;
                 g_snapshot = new_snap;
+                new_snap = nullptr;
             }
         } else {
             g_snapshot = new_snap;
+            new_snap = nullptr;
         }
         IOLockUnlock(g_lock);
     } else {
+        /* No lock: we can’t safely publish, just discard */
         old_snap = new_snap;
+        new_snap = nullptr;
     }
 
     /* Free stale snapshot memory OUTSIDE the lock */
