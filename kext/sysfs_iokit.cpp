@@ -186,7 +186,8 @@ sysfs_snap_build(void)
     sysfs_snap_free();
 
     uint32_t maxe = sysfs_count_entries();          /* upper bound (dups possible) */
-    uint32_t cap  = maxe + 1;                        /* +1 for the synthetic root */
+    uint32_t buffer = (maxe / 10) + 32;             /* Small adaptive buffer for dynamic nodes attached mid-scan */
+    uint32_t cap = maxe + buffer + 1;               /* +1 for synthetic root */
 
     /* Power-of-two hash table, >= 2x capacity, min 16. */
     uint32_t hsize = 16;
