@@ -143,6 +143,29 @@ endif
 # ---------------------------------------------------------------------------
 
 install:
+	sudo make uninstall
+	test -d "$(OUT)/sysfs.kext"
+	sudo cp -r "$(OUT)/sysfs.kext" "$(EXT_DIR)/sysfs.kext"
+	sudo chmod -R 755 "$(EXT_DIR)/sysfs.kext"
+	sudo chown -R root:wheel "$(EXT_DIR)/sysfs.kext"
+	sudo cp -r "$(OUT)/sysfs.fs" "$(FS_DIR)/sysfs.fs"
+	sudo chmod -R 755 "$(FS_DIR)/sysfs.fs"
+	sudo chown -R root:wheel "$(FS_DIR)/sysfs.fs"
+	@echo "sysfs: installed the kext and mount bundle."
+	@# Install the LaunchDaemon
+	sudo install -d -m 755 -o root -g wheel "$(SBIN_DIR)"
+	sudo install -m 755 -o root -g wheel "tools/$(MOUNT_SCRIPT)" "$(SBIN_DIR)/$(MOUNT_SCRIPT)"
+	sudo install -m 644 -o root -g wheel "tools/$(DAEMON_PLIST)" "$(DAEMON_DIR)/$(DAEMON_PLIST)"
+	@# A prior `launchctl disable` persists across boots in launchd's override
+	@# store and would keep the daemon from starting even though it is RunAtLoad.
+	-sudo launchctl enable "system/$(DAEMON_LABEL)" 2>/dev/null || true
+	@# Create the /sys mount point on the read-only system volume via synthetic.conf.
+	sudo sh -c 'grep -qxF sys "$(SYNTHETIC_CONF)" 2>/dev/null || printf "sys\n" >> "$(SYNTHETIC_CONF)"'
+	@echo "sysfs: installed the auto-mount LaunchDaemon and ensured 'sys' in $(SYNTHETIC_CONF)."
+	sudo touch $(ARM_FLAG)
+	@echo "sysfs: auto-mount endabled at $(ARM_FLAG)"
+
+install-kextfs:
 	test -d "$(OUT)/sysfs.kext"
 	sudo cp -r "$(OUT)/sysfs.kext" "$(EXT_DIR)/sysfs.kext"
 	sudo chmod -R 755 "$(EXT_DIR)/sysfs.kext"
@@ -191,4 +214,4 @@ clean:
 	$(MAKE) -C fs clean || true
 	rm -rf $(OUT)
 
-.PHONY: all kextfs install install-daemon uninstall clean
+.PHONY: all kextfs install install-kextfs install-daemon uninstall clean
