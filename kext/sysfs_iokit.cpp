@@ -221,9 +221,13 @@ sysfs_snap_build(void)
             if (sysfs_hash_find(regid) != SYSFS_IDX_NONE) {
                 continue;   /* DAG duplicate - keep the first appearance */
             }
+
             IORegistryEntry *parent = e->getParentEntry(gIOServicePlane);
-            uint64_t pregid = (parent == nullptr || parent == root)
-                ? 0 : parent->getRegistryEntryID();
+            uint64_t pregid = 0;
+            if (parent != nullptr) {
+                pregid = (parent == root) ? 0 : parent->getRegistryEntryID();
+                parent->release(); /* Release the reference returned by getParentEntry */
+            }
 
             struct sysfs_snap_node *nd = &g_nodes[count];
             nd->regid = regid;
