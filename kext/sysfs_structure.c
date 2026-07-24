@@ -38,7 +38,7 @@ STATIC sfssnode_t *add_node(sfssnode_t *parent, const char *name, sfstype type, 
 STATIC sfssnode_t *add_directory(sfssnode_t *parent, const char *name, sfstype type, sfsbaseid_t node_id, uint16_t flags, boolean_t raw,
                         sysfs_node_size_fn node_size_fn, sysfs_read_data_fn node_read_data_fn);
 
-STATIC void release_node(sfssnode_t *node);
+STATIC void release_node(sfssnode_t *root);
 
 /*
  * Next node id. No need to lock this value because access is guaranteed to be
@@ -232,27 +232,37 @@ add_directory(sfssnode_t *parent, const char *name, sfstype type, sfsbaseid_t no
  * happens only when the last instance of the file system is unmounted.
  */
 void
-release_node(sfssnode_t *snode)
+release_node(sfssnode_t *root)
 {
-    /*
-     * Remove from its parent's children list, if it has one.
-     */
-    if (snode->ssn_parent != NULL) {
-        TAILQ_REMOVE(&snode->ssn_parent->ssn_children, snode, ssn_next);
-    }
+    sfssnode_t *stack[128];
+    int sp = 0;
 
-    /*
-     * Release all child nodes.
-     */
-    sfssnode_t *child = TAILQ_FIRST(&snode->ssn_children);
-    while (child != NULL) {
-        TAILQ_REMOVE(&snode->ssn_children, child, ssn_next);
-        release_node(child);
-        child = TAILQ_FIRST(&snode->ssn_children);
-    }
+    stack[sp++] = root;
 
-    /*
-     * Free this node's memory.
-     */
-    OSFree(snode, sizeof(sfssnode_t), sysfs_osmalloc_tag);
+    while (sp > 0) {
+        sfssnode_t *node = stack[--sp];
+
+        /*
+         * Release all child nodes.
+         */
+        sfssnode_t *child = TAILQ_FIRST(&node->ssn_children);
+        while (child != NULL) {
+            sfssnode_t *next = TAILQ_NEXT(child, ssn_next);
+            TAILQ_REMOVE(&node->ssn_children, child, ssn_next);
+            stack[sp++] = child;
+            child = next;
+        }
+
+        /*
+         * Remove from its parent's children list, if it has one.
+         */
+        if (node->ssn_parent != NULL) {
+            TAILQ_REMOVE(&node->ssn_parent->ssn_children, node, ssn_next);
+        }
+
+        /*
+         * Free this node's memory.
+         */
+        OSFree(node, sizeof(sfssnode_t), sysfs_osmalloc_tag);
+    }
 }
