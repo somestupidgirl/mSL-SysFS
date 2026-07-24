@@ -234,7 +234,6 @@ sysfs_snap_build(void)
             uint64_t pregid = 0;
             if (parent != nullptr) {
                 pregid = (parent == root) ? 0 : parent->getRegistryEntryID();
-                parent->release(); /* Release the reference returned by getParentEntry */
             }
 
             struct sysfs_snap_node *nd = &g_nodes[count];
