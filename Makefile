@@ -197,6 +197,10 @@ install-daemon:
 	@echo "         sudo touch $(ARM_FLAG)"
 	@echo "sysfs: then REBOOT (creates /sys, loads the kext, mounts sysfs at /sys)."
 
+make rebuild-kextcache:
+	sudo kextcache -i /
+	sudo kmutil rebuild
+
 uninstall:
 	-sudo launchctl bootout "system/$(DAEMON_LABEL)" 2>/dev/null || true
 	sudo rm -f "$(DAEMON_DIR)/$(DAEMON_PLIST)" || true
@@ -214,4 +218,4 @@ clean:
 	$(MAKE) -C fs clean || true
 	rm -rf $(OUT)
 
-.PHONY: all kextfs install install-kextfs install-daemon uninstall clean
+.PHONY: all kextfs install install-kextfs install-daemon rebuild-kextcache uninstall clean
