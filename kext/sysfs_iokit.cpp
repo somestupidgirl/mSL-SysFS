@@ -62,16 +62,20 @@ struct sysfs_hash_slot {
     uint32_t index;           /* SYSFS_IDX_NONE == empty */
 };
 
+/* Container holding a full self-contained IOKit registry snapshot */
+struct sysfs_snapshot {
+    struct sysfs_snap_node *nodes;
+    uint32_t               *child_idx;
+    struct sysfs_hash_slot *hash;
+    uint32_t                node_count;
+    uint32_t                node_cap;
+    uint32_t                child_cap;
+    uint32_t                hash_size;
+    uint64_t                uptime;
+};
+
 static IOLock                 *g_lock       = nullptr;
-static struct sysfs_snap_node *g_nodes      = nullptr;
-static uint32_t               *g_child_idx  = nullptr;
-static struct sysfs_hash_slot *g_hash       = nullptr;
-static uint32_t                g_node_count = 0;   /* used nodes (incl. root) */
-static uint32_t                g_node_cap   = 0;   /* allocated nodes */
-static uint32_t                g_child_cap  = 0;   /* allocated child_idx */
-static uint32_t                g_hash_size  = 0;   /* power of two */
-static uint64_t                g_snap_uptime = 0;
-static bool                    g_snap_valid  = false;
+static struct sysfs_snapshot  *g_snapshot    = nullptr;
 
 #pragma mark - allocation helpers
 
@@ -94,22 +98,21 @@ sysfs_free(void *addr, size_t len)
 }
 
 static void
-sysfs_snap_free(void)
+sysfs_snap_free(struct sysfs_snapshot *snap)
 {
-    if (g_nodes != nullptr) {
-        sysfs_free(g_nodes, (size_t)g_node_cap * sizeof(*g_nodes));
-        g_nodes = nullptr;
+    if (snap == nullptr) {
+        return;
     }
-    if (g_child_idx != nullptr) {
-        sysfs_free(g_child_idx, (size_t)g_child_cap * sizeof(*g_child_idx));
-        g_child_idx = nullptr;
+    if (snap->nodes != nullptr) {
+        sysfs_free(snap->nodes, (size_t)snap->node_cap * sizeof(*snap->nodes));
     }
-    if (g_hash != nullptr) {
-        sysfs_free(g_hash, (size_t)g_hash_size * sizeof(*g_hash));
-        g_hash = nullptr;
+    if (snap->child_idx != nullptr) {
+        sysfs_free(snap->child_idx, (size_t)snap->child_cap * sizeof(*snap->child_idx));
     }
-    g_node_count = g_node_cap = g_child_cap = g_hash_size = 0;
-    g_snap_valid = false;
+    if (snap->hash != nullptr) {
+        sysfs_free(snap->hash, (size_t)snap->hash_size * sizeof(*snap->hash));
+    }
+    sysfs_free(snap, sizeof(*snap));
 }
 
 #pragma mark - hash (regid -> node index)
@@ -122,17 +125,17 @@ sysfs_hash_of(uint64_t regid)
 }
 
 static void
-sysfs_hash_insert(uint64_t regid, uint32_t index)
+sysfs_hash_insert(struct sysfs_snapshot *snap, uint64_t regid, uint32_t index)
 {
-    uint32_t mask = g_hash_size - 1;
+    uint32_t mask = snap->hash_size - 1;
     uint32_t h = sysfs_hash_of(regid) & mask;
-    for (uint32_t n = 0; n < g_hash_size; n++) {
-        if (g_hash[h].index == SYSFS_IDX_NONE) {
-            g_hash[h].regid = regid;
-            g_hash[h].index = index;
+    for (uint32_t n = 0; n < snap->hash_size; n++) {
+        if (snap->hash[h].index == SYSFS_IDX_NONE) {
+            snap->hash[h].regid = regid;
+            snap->hash[h].index = index;
             return;
         }
-        if (g_hash[h].index != SYSFS_IDX_NONE && g_hash[h].regid == regid) {
+        if (snap->hash[h].index != SYSFS_IDX_NONE && snap->hash[h].regid == regid) {
             return;   /* already present (dedup) */
         }
         h = (h + 1) & mask;
@@ -141,19 +144,19 @@ sysfs_hash_insert(uint64_t regid, uint32_t index)
 
 /* Returns node index for regid, or SYSFS_IDX_NONE. */
 static uint32_t
-sysfs_hash_find(uint64_t regid)
+sysfs_hash_find(const struct sysfs_snapshot *snap, uint64_t regid)
 {
-    if (g_hash == nullptr || g_hash_size == 0) {
+    if (snap == nullptr || snap->hash == nullptr || snap->hash_size == 0) {
         return SYSFS_IDX_NONE;
     }
-    uint32_t mask = g_hash_size - 1;
+    uint32_t mask = snap->hash_size - 1;
     uint32_t h = sysfs_hash_of(regid) & mask;
-    for (uint32_t n = 0; n < g_hash_size; n++) {
-        if (g_hash[h].index == SYSFS_IDX_NONE) {
+    for (uint32_t n = 0; n < snap->hash_size; n++) {
+        if (snap->hash[h].index == SYSFS_IDX_NONE) {
             return SYSFS_IDX_NONE;
         }
-        if (g_hash[h].regid == regid) {
-            return g_hash[h].index;
+        if (snap->hash[h].regid == regid) {
+            return snap->hash[h].index;
         }
         h = (h + 1) & mask;
     }
@@ -179,11 +182,15 @@ sysfs_count_entries(void)
     return n;
 }
 
-/* (Re)build the snapshot. Caller holds g_lock. */
-static void
+
+/* Builds a fresh snapshot completely in isolation without holding global locks. */
+static struct sysfs_snapshot *
 sysfs_snap_build(void)
 {
-    sysfs_snap_free();
+    struct sysfs_snapshot *snap = (struct sysfs_snapshot *)sysfs_alloc(sizeof(*snap));
+    if (snap == nullptr) {
+        return nullptr;
+    }
 
     uint32_t maxe = sysfs_count_entries();          /* upper bound (dups possible) */
     uint32_t buffer = (maxe / 10) + 32;             /* Small adaptive buffer for dynamic nodes attached mid-scan */
@@ -195,25 +202,25 @@ sysfs_snap_build(void)
         hsize <<= 1;
     }
 
-    g_nodes     = (struct sysfs_snap_node *)sysfs_alloc((size_t)cap * sizeof(*g_nodes));
-    g_child_idx = (uint32_t *)sysfs_alloc((size_t)cap * sizeof(*g_child_idx));
-    g_hash      = (struct sysfs_hash_slot *)sysfs_alloc((size_t)hsize * sizeof(*g_hash));
-    if (g_nodes == nullptr || g_child_idx == nullptr || g_hash == nullptr) {
-        sysfs_snap_free();
-        return;
+    snap->nodes     = (struct sysfs_snap_node *)sysfs_alloc((size_t)cap * sizeof(*snap->nodes));
+    snap->child_idx = (uint32_t *)sysfs_alloc((size_t)cap * sizeof(*snap->child_idx));
+    snap->hash      = (struct sysfs_hash_slot *)sysfs_alloc((size_t)hsize * sizeof(*snap->hash));
+    if (snap->nodes == nullptr || snap->child_idx == nullptr || snap->hash == nullptr) {
+        sysfs_snap_free(snap);
+        return nullptr;
     }
-    g_node_cap  = cap;
-    g_child_cap = cap;
-    g_hash_size = hsize;
+    snap->node_cap  = cap;
+    snap->child_cap = cap;
+    snap->hash_size = hsize;
     for (uint32_t i = 0; i < hsize; i++) {
-        g_hash[i].index = SYSFS_IDX_NONE;
+        snap->hash[i].index = SYSFS_IDX_NONE;
     }
 
     /* Node 0: the synthetic root / devices container. */
-    g_nodes[0].regid = 0;
-    g_nodes[0].parent_regid = 0;
-    g_nodes[0].name[0] = '\0';
-    sysfs_hash_insert(0, 0);
+    snap->nodes[0].regid = 0;
+    snap->nodes[0].parent_regid = 0;
+    snap->nodes[0].name[0] = '\0';
+    sysfs_hash_insert(snap, 0, 0);
     uint32_t count = 1;
 
     IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
@@ -226,7 +233,7 @@ sysfs_snap_build(void)
             if (regid == 0) {
                 continue;   /* reserved for the root sentinel */
             }
-            if (sysfs_hash_find(regid) != SYSFS_IDX_NONE) {
+            if (sysfs_hash_find(snap, regid) != SYSFS_IDX_NONE) {
                 continue;   /* DAG duplicate - keep the first appearance */
             }
 
@@ -236,73 +243,111 @@ sysfs_snap_build(void)
                 pregid = (parent == root) ? 0 : parent->getRegistryEntryID();
             }
 
-            struct sysfs_snap_node *nd = &g_nodes[count];
+            struct sysfs_snap_node *nd = &snap->nodes[count];
             nd->regid = regid;
             nd->parent_regid = pregid;
             nd->first_child = 0;
             nd->num_children = 0;
             const char *nm = e->getName(gIOServicePlane);
             strlcpy(nd->name, nm != nullptr ? nm : "unknown", sizeof(nd->name));
-            sysfs_hash_insert(regid, count);
+            sysfs_hash_insert(snap, regid, count);
             count++;
         }
         it->release();
     }
-    g_node_count = count;
+    snap->node_count = count;
 
     /* Build CSR child lists: count, prefix-sum, fill. A node's parent maps to a
      * node index via the hash (parent_regid 0 -> root at index 0); an orphan
      * whose parent was not captured is attached to the root. */
     for (uint32_t i = 1; i < count; i++) {
-        uint32_t p = sysfs_hash_find(g_nodes[i].parent_regid);
+        uint32_t p = sysfs_hash_find(snap, snap->nodes[i].parent_regid);
         if (p == SYSFS_IDX_NONE) {
             p = 0;
         }
-        g_nodes[p].num_children++;
+        snap->nodes[p].num_children++;
     }
     uint32_t off = 0;
     for (uint32_t j = 0; j < count; j++) {
-        g_nodes[j].first_child = off;
-        off += g_nodes[j].num_children;
+        snap->nodes[j].first_child = off;
+        off += snap->nodes[j].num_children;
     }
     /* Temporary fill cursors (reuse a small alloc). */
     uint32_t *cursor = (uint32_t *)sysfs_alloc((size_t)count * sizeof(uint32_t));
     if (cursor == nullptr) {
         /* Without cursors we cannot place children; drop to an empty tree. */
         for (uint32_t j = 0; j < count; j++) {
-            g_nodes[j].num_children = 0;
+            snap->nodes[j].num_children = 0;
         }
     } else {
         for (uint32_t j = 0; j < count; j++) {
-            cursor[j] = g_nodes[j].first_child;
+            cursor[j] = snap->nodes[j].first_child;
         }
         for (uint32_t i = 1; i < count; i++) {
-            uint32_t p = sysfs_hash_find(g_nodes[i].parent_regid);
+            uint32_t p = sysfs_hash_find(snap, snap->nodes[i].parent_regid);
             if (p == SYSFS_IDX_NONE) {
                 p = 0;
             }
-            g_child_idx[cursor[p]++] = i;
+            snap->child_idx[cursor[p]++] = i;
         }
         sysfs_free(cursor, (size_t)count * sizeof(uint32_t));
     }
 
-    clock_get_uptime(&g_snap_uptime);
-    g_snap_valid = true;
+    clock_get_uptime(&snap->uptime);
+    return snap;
 }
 
-/* Ensure a fresh-enough snapshot exists. Caller holds g_lock. */
+/* Ensure a fresh-enough snapshot exists using RCU / Copy-on-Write double checking. */
 static void
 sysfs_snap_ensure(void)
 {
-    if (g_snap_valid && g_nodes != nullptr) {
-        uint64_t now, elapsed_ns;
-        clock_get_uptime(&now);
-        absolutetime_to_nanoseconds(now - g_snap_uptime, &elapsed_ns);
-        if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
-            return;
+    uint64_t now, elapsed_ns;
+    clock_get_uptime(&now);
+
+    /* Fast check under lock */
+    if (g_lock != nullptr) {
+        IOLockLock(g_lock);
+        if (g_snapshot != nullptr) {
+            absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
+            if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
+                IOLockUnlock(g_lock);
+                return;
+            }
         }
+        IOLockUnlock(g_lock);
     }
-    sysfs_snap_build();
+
+    /* Build new snapshot UNLOCKED (heavy IOKit traversal & IOMalloc happen here) */
+    struct sysfs_snapshot *new_snap = sysfs_snap_build();
+    if (new_snap == nullptr) {
+        return;
+    }
+
+    /* Re-acquire lock to swap pointers safely */
+    struct sysfs_snapshot *old_snap = nullptr;
+    if (g_lock != nullptr) {
+        IOLockLock(g_lock);
+        if (g_snapshot != nullptr) {
+            absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
+            if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
+                /* Another thread refreshed it while unlocked; throw away our snapshot */
+                old_snap = new_snap;
+            } else {
+                old_snap = g_snapshot;
+                g_snapshot = new_snap;
+            }
+        } else {
+            g_snapshot = new_snap;
+        }
+        IOLockUnlock(g_lock);
+    } else {
+        old_snap = new_snap;
+    }
+
+    /* Free stale snapshot memory OUTSIDE the lock */
+    if (old_snap != nullptr) {
+        sysfs_snap_free(old_snap);
+    }
 }
 
 #pragma mark - display names
@@ -312,20 +357,20 @@ sysfs_snap_ensure(void)
  * name), and its regid into *child_regid. Returns true if that child exists.
  * Caller holds g_lock. */
 static bool
-sysfs_child_display(uint32_t pidx, uint32_t index, char *buf, size_t buflen,
+sysfs_child_display(const struct sysfs_snapshot *snap, uint32_t pidx, uint32_t index, char *buf, size_t buflen,
                     uint64_t *child_regid)
 {
-    if (pidx >= g_node_count || index >= g_nodes[pidx].num_children) {
+    if (snap == nullptr || pidx >= snap->node_count || index >= snap->nodes[pidx].num_children) {
         return false;
     }
-    uint32_t base = g_nodes[pidx].first_child;
-    uint32_t ci = g_child_idx[base + index];
-    const char *nm = g_nodes[ci].name;
+    uint32_t base = snap->nodes[pidx].first_child;
+    uint32_t ci = snap->child_idx[base + index];
+    const char *nm = snap->nodes[ci].name;
 
     uint32_t dup = 0;
     for (uint32_t k = 0; k < index; k++) {
-        uint32_t sib = g_child_idx[base + k];
-        if (strcmp(g_nodes[sib].name, nm) == 0) {
+        uint32_t sib = snap->child_idx[base + k];
+        if (strcmp(snap->nodes[sib].name, nm) == 0) {
             dup++;
         }
     }
@@ -334,7 +379,7 @@ sysfs_child_display(uint32_t pidx, uint32_t index, char *buf, size_t buflen,
     } else {
         snprintf(buf, buflen, "%s@%u", nm, dup);
     }
-    *child_regid = g_nodes[ci].regid;
+    *child_regid = snap->nodes[ci].regid;
     return true;
 }
 
@@ -353,8 +398,10 @@ sysfs_iokit_teardown(void)
 {
     if (g_lock != nullptr) {
         IOLockLock(g_lock);
-        sysfs_snap_free();
+        struct sysfs_snapshot *old_snap = g_snapshot;
+        g_snapshot = nullptr;
         IOLockUnlock(g_lock);
+        sysfs_snap_free(old_snap);
         IOLockFree(g_lock);
         g_lock = nullptr;
     }
@@ -369,9 +416,9 @@ sysfs_iokit_entry_exists(uint64_t regid)
     if (g_lock == nullptr) {
         return 0;
     }
-    IOLockLock(g_lock);
     sysfs_snap_ensure();
-    int found = (sysfs_hash_find(regid) != SYSFS_IDX_NONE) ? 1 : 0;
+    IOLockLock(g_lock);
+    int found = (sysfs_hash_find(g_snapshot, regid) != SYSFS_IDX_NONE) ? 1 : 0;
     IOLockUnlock(g_lock);
     return found;
 }
@@ -383,12 +430,12 @@ sysfs_iokit_child_at(uint64_t regid, unsigned int index,
     if (namebuf == nullptr || child_regid == nullptr || buflen == 0 || g_lock == nullptr) {
         return 0;
     }
-    IOLockLock(g_lock);
     sysfs_snap_ensure();
-    uint32_t pidx = sysfs_hash_find(regid);
+    IOLockLock(g_lock);
+    uint32_t pidx = sysfs_hash_find(g_snapshot, regid);
     int ok = 0;
     if (pidx != SYSFS_IDX_NONE) {
-        ok = sysfs_child_display(pidx, (uint32_t)index, namebuf, buflen, child_regid) ? 1 : 0;
+        ok = sysfs_child_display(g_snapshot, pidx, (uint32_t)index, namebuf, buflen, child_regid) ? 1 : 0;
     }
     IOLockUnlock(g_lock);
     return ok;
@@ -401,16 +448,16 @@ sysfs_iokit_child_named(uint64_t regid, const char *name, size_t namelen,
     if (name == nullptr || child_regid == nullptr || g_lock == nullptr) {
         return 0;
     }
-    IOLockLock(g_lock);
     sysfs_snap_ensure();
+    IOLockLock(g_lock);
     int found = 0;
-    uint32_t pidx = sysfs_hash_find(regid);
+    uint32_t pidx = sysfs_hash_find(g_snapshot, regid);
     if (pidx != SYSFS_IDX_NONE) {
         char buf[SYSFS_IOKIT_NAMEMAX + 16];
-        uint32_t n = g_nodes[pidx].num_children;
+        uint32_t n = g_snapshot->nodes[pidx].num_children;
         for (uint32_t i = 0; i < n; i++) {
             uint64_t id = 0;
-            if (!sysfs_child_display(pidx, i, buf, sizeof(buf), &id)) {
+            if (!sysfs_child_display(g_snapshot, pidx, i, buf, sizeof(buf), &id)) {
                 break;
             }
             if (strlen(buf) == namelen && strncmp(buf, name, namelen) == 0) {
@@ -437,12 +484,12 @@ sysfs_iokit_parent(uint64_t regid, uint64_t *parent_regid)
     if (g_lock == nullptr) {
         return 0;
     }
-    IOLockLock(g_lock);
     sysfs_snap_ensure();
+    IOLockLock(g_lock);
     int ok = 0;
-    uint32_t idx = sysfs_hash_find(regid);
+    uint32_t idx = sysfs_hash_find(g_snapshot, regid);
     if (idx != SYSFS_IDX_NONE) {
-        *parent_regid = g_nodes[idx].parent_regid;
+        *parent_regid = g_snapshot->nodes[idx].parent_regid;
         ok = 1;
     }
     IOLockUnlock(g_lock);
@@ -455,12 +502,12 @@ sysfs_iokit_name(uint64_t regid, char *buf, size_t buflen)
     if (buf == nullptr || buflen == 0 || g_lock == nullptr) {
         return 0;
     }
-    IOLockLock(g_lock);
     sysfs_snap_ensure();
+    IOLockLock(g_lock);
     size_t n = 0;
-    uint32_t idx = sysfs_hash_find(regid);
+    uint32_t idx = sysfs_hash_find(g_snapshot, regid);
     if (idx != SYSFS_IDX_NONE) {
-        strlcpy(buf, g_nodes[idx].name, buflen);
+        strlcpy(buf, g_snapshot->nodes[idx].name, buflen);
         n = strlen(buf);
     }
     IOLockUnlock(g_lock);
