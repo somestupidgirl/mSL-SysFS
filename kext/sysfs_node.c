@@ -94,6 +94,7 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
     boolean_t locked = TRUE;
     sfsnode_t *target_sfsnode = NULL;     /* This is the node that we will return. */
     sfsnode_t *new_sfsnode = NULL;        /* Newly allocated node. Will be freed if not used. */
+    boolean_t new_sfsnode_inserted = FALSE;
     vnode_t target_vnode = NULL;          /* Start by assuming we will not get a vnode. */
     int32_t mount_id = smp->pmnt_id;      /* File system id. */
 
@@ -188,6 +189,7 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
                  * it belongs to.
                  */
                 LIST_INSERT_HEAD(hash_bucket, target_sfsnode, node_hash);
+                new_sfsnode_inserted = TRUE;
             }
         }
 
@@ -241,10 +243,17 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
                  * was removed from the hash and freed, so we will be restarting from scratch.
                  */
                 lck_mtx_lock(sfsnode_hash_mutex);
-                target_sfsnode = NULL;
-                OSFree(new_sfsnode, sizeof(sfsnode_t), sysfs_osmalloc_tag);
-                new_sfsnode = NULL;
                 locked = TRUE;
+
+                /* We *assume* reclaim removed target_sfsnode from hash and freed it.
+                 * Do NOT free new_sfsnode unless we know it was never inserted.
+                 */
+                if (!new_sfsnode_inserted && new_sfsnode != NULL) {
+                    OSFree(new_sfsnode, sizeof(sfsnode_t), sysfs_osmalloc_tag);
+                    new_sfsnode = NULL;
+                }
+
+                target_sfsnode = NULL;
                 continue;
             }
 
@@ -329,7 +338,7 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
      * Free the node we allocated, if we didn't use it. We do this
      * after releasing the hash lock just in case it might block.
      */
-    if (new_sfsnode != NULL && new_sfsnode != target_sfsnode) {
+    if (new_sfsnode != NULL && new_sfsnode != target_sfsnode && !new_sfsnode_inserted) {
         OSFree(new_sfsnode, sizeof(sfsnode_t), sysfs_osmalloc_tag);
         new_sfsnode = NULL;
     }
