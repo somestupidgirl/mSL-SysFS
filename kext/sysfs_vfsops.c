@@ -244,9 +244,20 @@ sysfs_unmount(struct mount *mp, __unused int mntflags, __unused vfs_context_t co
         sysfs_mp = NULL;
 
         /*
-         * Decrement mounted instance count.
+         * Decrement mounted instance count atomically and check 
+         * if this was the last active mount.
          */
-        OSAddAtomic(-1, &mounted_instance_count);
+        if (OSAddAtomic(-1, &mounted_instance_count) == 1) {
+            /*
+             * OSAddAtomic returns the value PRIOR to the subtraction.
+             * If the returned value was 1, count is now 0.
+             * Safe to tear down the shared hash table!
+             */
+            if (sfsnode_hash_buckets != NULL) {
+                hashdestroy(sfsnode_hash_buckets, M_CACHE, sfsnode_hash_to_bucket_mask);
+                sfsnode_hash_buckets = NULL;
+            }
+        }
     }
     sysfs_structure_free();
 
