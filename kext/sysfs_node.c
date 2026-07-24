@@ -299,8 +299,10 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
              * release it.
              */
             sysfsnode_free_node(target_sfsnode);
+            if (target_sfsnode == new_sfsnode) {
+                new_sfsnode = NULL; /* Prevent double free of the newly created node */
+            }
             target_sfsnode = NULL;
-            new_sfsnode = NULL; /* To avoid double free. */
             break;
         }
 
