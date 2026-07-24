@@ -39,23 +39,54 @@ int
 sysfs_init(__unused struct vfsconf *vfsconf)
 {
     int error = 0;
+    static int initialized = 0; // Protect against multiple calls.
 
-    static int initialized;  // Protect against multiple calls.
-
-    if (!initialized) {
-        initialized = 1;
-
-        // Create the tag for memory allocation.
-        sysfs_osmalloc_tag = OSMalloc_Tagalloc(BUNDLEID_S, OSMT_DEFAULT);
-
-        if (sysfs_osmalloc_tag == NULL) {
-            return ENOMEM;   // Plausible error code.
-        }
-
-        // Allocate the lock group and the mutex lock for the hash table.
-        sfsnode_lck_grp = lck_grp_alloc_init(SYSFS_LCKGRP_NAME, LCK_GRP_ATTR_NULL);
-        sfsnode_hash_mutex = lck_mtx_alloc_init(sfsnode_lck_grp, LCK_ATTR_NULL);
+    if (initialized) {
+        return 0;
     }
+
+    // Create the tag for memory allocation.
+    sysfs_osmalloc_tag = OSMalloc_Tagalloc(BUNDLEID_S, OSMT_DEFAULT);
+    if (sysfs_osmalloc_tag == NULL) {
+        return ENOMEM;
+    }
+
+    // Allocate the lock group attribute.
+    lck_grp_attr_t *sfsnode_lck_grp_attr = lck_grp_attr_alloc_init();
+    if (sfsnode_lck_grp_attr == NULL) {
+        error = ENOMEM;
+        goto fail_tag;
+    }
+
+    // Allocate the lock group using the custom attribute.
+    sfsnode_lck_grp = lck_grp_alloc_init(SYSFS_LCKGRP_NAME, sfsnode_lck_grp_attr);
+
+    // Free the attribute handle immediately; sfsnode_lck_grp is already initialized.
+    lck_grp_attr_free(sfsnode_lck_grp_attr); 
+
+    if (sfsnode_lck_grp == NULL) {
+        error = ENOMEM;
+        goto fail_tag;
+    }
+
+    // Allocate the mutex lock for the hash table.
+    sfsnode_hash_mutex = lck_mtx_alloc_init(sfsnode_lck_grp, LCK_ATTR_NULL);
+    if (sfsnode_hash_mutex == NULL) {
+        error = ENOMEM;
+        goto fail_grp;
+    }
+
+    initialized = 1;
+    return 0;
+
+/* Error Rollback Paths */
+fail_grp:
+    lck_grp_free(sfsnode_lck_grp);
+    sfsnode_lck_grp = NULL;
+
+fail_tag:
+    OSMalloc_Tagfree(sysfs_osmalloc_tag);
+    sysfs_osmalloc_tag = NULL;
 
     return error;
 }
