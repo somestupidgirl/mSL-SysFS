@@ -86,18 +86,26 @@ sysfs_alloc(size_t n)
 }
 
 static void
+sysfs_free(void *addr, size_t len)
+{
+    if (addr != nullptr && len > 0) {
+        IOFree(addr, len);
+    }
+}
+
+static void
 sysfs_snap_free(void)
 {
     if (g_nodes != nullptr) {
-        IOFree(g_nodes, (size_t)g_node_cap * sizeof(*g_nodes));
+        sysfs_free(g_nodes, (size_t)g_node_cap * sizeof(*g_nodes));
         g_nodes = nullptr;
     }
     if (g_child_idx != nullptr) {
-        IOFree(g_child_idx, (size_t)g_child_cap * sizeof(*g_child_idx));
+        sysfs_free(g_child_idx, (size_t)g_child_cap * sizeof(*g_child_idx));
         g_child_idx = nullptr;
     }
     if (g_hash != nullptr) {
-        IOFree(g_hash, (size_t)g_hash_size * sizeof(*g_hash));
+        sysfs_free(g_hash, (size_t)g_hash_size * sizeof(*g_hash));
         g_hash = nullptr;
     }
     g_node_count = g_node_cap = g_child_cap = g_hash_size = 0;
@@ -158,8 +166,7 @@ sysfs_hash_find(uint64_t regid)
 static uint32_t
 sysfs_count_entries(void)
 {
-    IORegistryIterator *it =
-        IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
+    IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
     if (it == nullptr) {
         return 0;
     }
@@ -276,7 +283,7 @@ sysfs_snap_build(void)
             }
             g_child_idx[cursor[p]++] = i;
         }
-        IOFree(cursor, (size_t)count * sizeof(uint32_t));
+        sysfs_free(cursor, (size_t)count * sizeof(uint32_t));
     }
 
     clock_get_uptime(&g_snap_uptime);
