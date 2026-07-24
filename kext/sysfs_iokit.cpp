@@ -259,23 +259,54 @@ sysfs_snap_build(void)
 
     /* Build CSR child lists: count, prefix-sum, fill. A node's parent maps to a
      * node index via the hash (parent_regid 0 -> root at index 0); an orphan
-     * whose parent was not captured is attached to the root. */
+     * whose parent was not captured is attached to the root.
+     */
+    uint64_t *child_counts =
+        (uint64_t *)sysfs_alloc((size_t)count * sizeof(uint64_t));
+    if (child_counts == nullptr) {
+        /* Cannot safely build child lists; fall back to empty tree. */
+        for (uint32_t j = 0; j < count; j++) {
+            snap->nodes[j].num_children = 0;
+            snap->nodes[j].first_child  = 0;
+        }
+        clock_get_uptime(&snap->uptime);
+        return snap;
+    }
+
+    /* Count children per parent. */
     for (uint32_t i = 1; i < count; i++) {
         uint32_t p = sysfs_hash_find(snap, snap->nodes[i].parent_regid);
         if (p == SYSFS_IDX_NONE) {
             p = 0;
         }
-        snap->nodes[p].num_children++;
+        child_counts[p]++;
     }
+
+    /* Validate total child count fits in allocated child_idx array. */
+    uint64_t total_children = 0;
+    for (uint32_t j = 0; j < count; j++) {
+        total_children += child_counts[j];
+    }
+    if (total_children > snap->child_cap) {
+        /* Registry mutated too much mid-scan; abort safely. */
+        sysfs_free(child_counts, (size_t)count * sizeof(uint64_t));
+        sysfs_snap_free(snap);
+        return nullptr;
+    }
+
+    /* Assign num_children and prefix-sum first_child offsets. */
     uint32_t off = 0;
     for (uint32_t j = 0; j < count; j++) {
-        snap->nodes[j].first_child = off;
+        snap->nodes[j].num_children = (uint32_t)child_counts[j];
+        snap->nodes[j].first_child  = off;
         off += snap->nodes[j].num_children;
     }
-    /* Temporary fill cursors (reuse a small alloc). */
-    uint32_t *cursor = (uint32_t *)sysfs_alloc((size_t)count * sizeof(uint32_t));
+
+    /* Fill child_idx using temporary cursors. */
+    uint32_t *cursor =
+        (uint32_t *)sysfs_alloc((size_t)count * sizeof(uint32_t));
     if (cursor == nullptr) {
-        /* Without cursors we cannot place children; drop to an empty tree. */
+        /* Cannot place children; degrade to empty tree. */
         for (uint32_t j = 0; j < count; j++) {
             snap->nodes[j].num_children = 0;
         }
@@ -293,6 +324,7 @@ sysfs_snap_build(void)
         sysfs_free(cursor, (size_t)count * sizeof(uint32_t));
     }
 
+    sysfs_free(child_counts, (size_t)count * sizeof(uint64_t));
     clock_get_uptime(&snap->uptime);
     return snap;
 }
