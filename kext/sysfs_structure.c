@@ -41,6 +41,13 @@ STATIC sfssnode_t *add_directory(sfssnode_t *parent, const char *name, sfstype t
 STATIC void release_node(sfssnode_t *root);
 
 /*
+ * Depth bound for release_node()'s explicit node stack (it is iterative rather
+ * than recursive so a deep tree cannot overflow the kernel stack). The skeleton
+ * tree is a few dozen nodes, so this is generous.
+ */
+#define SYSFS_RELEASE_STACK_MAX 256
+
+/*
  * Next node id. No need to lock this value because access is guaranteed to be
  * single-threaded. Start at 2 because the root node is always 1.
  */
@@ -234,8 +241,32 @@ add_directory(sfssnode_t *parent, const char *name, sfstype type, sfsbaseid_t no
 void
 release_node(sfssnode_t *root)
 {
-    sfssnode_t *stack[128];
+    sfssnode_t *stack[SYSFS_RELEASE_STACK_MAX];
     int sp = 0;
+
+    if (root == NULL) {
+        return;
+    }
+
+    /*
+     * Detach the subtree's own root from its parent once, here. Every other node
+     * is detached by its parent's iteration below, and must NOT be detached
+     * again.
+     *
+     * That double-detach was a wild kernel write: a node is pushed only after
+     * its parent has already TAILQ_REMOVE'd it, and the parent is freed at the
+     * end of its own iteration - so removing the node "from its parent" when it
+     * was later popped both removed it from a list it was no longer on AND
+     * dereferenced an already-freed ssn_parent. TAILQ_REMOVE finishes with
+     * *(elm)->prev = elm->next, i.e. a store through a stale pointer into
+     * whatever had reused that memory. It corrupted the kernel heap on every
+     * unmount: the machine froze instantly and completely, with no panic,
+     * because it is silent corruption rather than a fault.
+     */
+    if (root->ssn_parent != NULL) {
+        TAILQ_REMOVE(&root->ssn_parent->ssn_children, root, ssn_next);
+        root->ssn_parent = NULL;
+    }
 
     stack[sp++] = root;
 
@@ -243,25 +274,32 @@ release_node(sfssnode_t *root)
         sfssnode_t *node = stack[--sp];
 
         /*
-         * Release all child nodes.
+         * Detach each child and queue it. Clearing ssn_parent as we go makes it
+         * impossible for a popped node to reach back into its (soon to be freed)
+         * parent.
          */
-        sfssnode_t *child = TAILQ_FIRST(&node->ssn_children);
-        while (child != NULL) {
-            sfssnode_t *next = TAILQ_NEXT(child, ssn_next);
+        sfssnode_t *child;
+        while ((child = TAILQ_FIRST(&node->ssn_children)) != NULL) {
             TAILQ_REMOVE(&node->ssn_children, child, ssn_next);
+            child->ssn_parent = NULL;
+
+            if (sp >= SYSFS_RELEASE_STACK_MAX) {
+                /*
+                 * Cannot queue any more. Leaking this subtree is bad, but it is
+                 * strictly better than overrunning the stack array - which would
+                 * be the same class of memory corruption this function is fixing.
+                 * The tree is a fixed, shallow skeleton, so this is unreachable
+                 * in practice; raise SYSFS_RELEASE_STACK_MAX if that changes.
+                 */
+                LOG_ERR("release_node: node stack full (%d); leaking a subtree",
+                        SYSFS_RELEASE_STACK_MAX);
+                break;
+            }
             stack[sp++] = child;
-            child = next;
         }
 
         /*
-         * Remove from its parent's children list, if it has one.
-         */
-        if (node->ssn_parent != NULL) {
-            TAILQ_REMOVE(&node->ssn_parent->ssn_children, node, ssn_next);
-        }
-
-        /*
-         * Free this node's memory.
+         * Free this node's memory. It is already off its parent's list.
          */
         OSFree(node, sizeof(sfssnode_t), sysfs_osmalloc_tag);
     }

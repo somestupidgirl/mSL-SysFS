@@ -17,6 +17,8 @@
 #include <os/log.h>
 #include <sys/mount.h>
 
+#include <sys/sysctl.h>
+
 #include <fs/sysfs/sysfs.h>
 #include <fs/sysfs/sysfs_iokit.h>
 
@@ -25,6 +27,114 @@
 
 extern struct vfs_fsentry sysfs_vfsentry;
 extern vfstable_t sysfs_vfs_table_ref;
+
+#pragma mark -
+#pragma mark Diagnostic sysctls
+
+/*
+ * Read-only counters for diagnosing runaway resource use while /sys is mounted:
+ *
+ *   sysctl sysfs
+ *
+ *     sysfs.snap_builds - full IORegistry snapshots built since load. Should be
+ *                         nearly flat once the device tree settles; a number
+ *                         that climbs steadily means rebuild churn.
+ *     sysfs.snap_bytes  - memory held by live snapshots right now. Should sit at
+ *                         roughly one snapshot's worth; steady growth means
+ *                         snapshots are not being freed.
+ *     sysfs.live_nodes  - sfsnode_t currently in the hash (one per live vnode).
+ *                         Should plateau and fall back; unbounded growth means
+ *                         vnodes are never reclaimed.
+ *
+ * Sample them a few times a minute apart with /sys mounted: whichever one grows
+ * without bound identifies the subsystem at fault.
+ */
+extern int64_t sysfs_stat_snap_builds;
+extern int64_t sysfs_stat_snap_bytes;
+extern int64_t sysfs_stat_live_nodes;
+
+/*
+ * The oids are built by hand rather than with the SYSCTL_NODE / SYSCTL_QUAD
+ * macros. Under XNU_KERNEL_PRIVATE (which this kext compiles with) those macros
+ * expand to an in-kernel STARTUP auto-registration referencing
+ * sysctl_register_oid_early() - an internal symbol NOT exported to kexts, so the
+ * kext fails to bind and never loads ("could not find a kext which exports this
+ * symbol"). Constructing the sysctl_oid structs directly and registering them
+ * through the KPI sysctl_register_oid() avoids that symbol entirely; omitting
+ * CTLFLAG_PERMANENT lets us remove them at unload. (Same fix as the procfs
+ * sibling's procfs.linux oids.)
+ */
+static struct sysctl_oid_list sysfs_sysctl_children;
+
+static struct sysctl_oid sysfs_sysctl_node = {
+    .oid_parent  = &sysctl__children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_NODE | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_sysctl_children,
+    .oid_arg2    = 0,
+    .oid_name    = "sysfs",
+    .oid_handler = NULL,
+    .oid_fmt     = "N",
+    .oid_descr   = "sysfs filesystem",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
+static struct sysctl_oid sysfs_sysctl_snap_builds = {
+    .oid_parent  = &sysfs_sysctl_children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_stat_snap_builds,
+    .oid_arg2    = 0,
+    .oid_name    = "snap_builds",
+    .oid_handler = sysctl_handle_quad,
+    .oid_fmt     = "Q",
+    .oid_descr   = "IORegistry snapshots built since load",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
+static struct sysctl_oid sysfs_sysctl_snap_bytes = {
+    .oid_parent  = &sysfs_sysctl_children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_stat_snap_bytes,
+    .oid_arg2    = 0,
+    .oid_name    = "snap_bytes",
+    .oid_handler = sysctl_handle_quad,
+    .oid_fmt     = "Q",
+    .oid_descr   = "bytes held by live IORegistry snapshots",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
+static struct sysctl_oid sysfs_sysctl_live_nodes = {
+    .oid_parent  = &sysfs_sysctl_children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_stat_live_nodes,
+    .oid_arg2    = 0,
+    .oid_name    = "live_nodes",
+    .oid_handler = sysctl_handle_quad,
+    .oid_fmt     = "Q",
+    .oid_descr   = "sfsnodes currently in the node hash",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
+STATIC void
+sysfs_sysctl_register(void)
+{
+    sysctl_register_oid(&sysfs_sysctl_node);   /* parent first */
+    sysctl_register_oid(&sysfs_sysctl_snap_builds);
+    sysctl_register_oid(&sysfs_sysctl_snap_bytes);
+    sysctl_register_oid(&sysfs_sysctl_live_nodes);
+}
+
+STATIC void
+sysfs_sysctl_unregister(void)
+{
+    sysctl_unregister_oid(&sysfs_sysctl_live_nodes);
+    sysctl_unregister_oid(&sysfs_sysctl_snap_bytes);
+    sysctl_unregister_oid(&sysfs_sysctl_snap_builds);
+    sysctl_unregister_oid(&sysfs_sysctl_node);
+}
 
 #pragma mark -
 #pragma mark Initialization and finishing routines
@@ -159,6 +269,11 @@ sysfs_start(kmod_info_t *ki, __unused void *d)
      */
     sysfs_iokit_init();
 
+    /*
+     * Diagnostic counters (sysctl sysfs).
+     */
+    sysfs_sysctl_register();
+
     os_log(OS_LOG_DEFAULT, "loaded %s version %s build %s (%s) \n",
         BUNDLEID_S, KEXTVERSION_S, KEXTBUILD_S, __TS__);
 
@@ -189,6 +304,8 @@ sysfs_stop(__unused kmod_info_t *ki, __unused void *d)
      * Release the IOKit snapshot and its lock (after the fs is unregistered, so
      * no more fs ops can reach it).
      */
+    sysfs_sysctl_unregister();
+
     sysfs_iokit_teardown();
 
     sysfs_fini();

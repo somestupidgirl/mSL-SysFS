@@ -24,6 +24,8 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 
+#include <kern/thread_call.h>
+
 #include <libkern/c++/OSObject.h>
 #include <libkern/c++/OSIterator.h>
 #include <libkern/libkern.h>
@@ -72,10 +74,69 @@ struct sysfs_snapshot {
     uint32_t                child_cap;
     uint32_t                hash_size;
     uint64_t                uptime;
+    size_t                  bytes;    /* total allocation, for sysfs_stat_snap_bytes */
 };
 
 static IOLock                 *g_lock       = nullptr;
 static struct sysfs_snapshot  *g_snapshot    = nullptr;
+
+/*
+ * Rebuild throttling. Building a snapshot is expensive (two full recursive
+ * service-plane traversals plus ~1MB of IOMalloc), so it must happen as rarely
+ * as possible and never more than once at a time:
+ *
+ *   g_building  - single-flight guard. Without it every concurrent caller that
+ *                 sees a stale snapshot builds its own and throws all but one
+ *                 away. Under a multi-threaded walk (Spotlight, File Manager,
+ *                 find) that is dozens of simultaneous full traversals, and as
+ *                 they slow each other down the build time eventually exceeds
+ *                 the TTL - at which point every published snapshot is already
+ *                 stale and the storm becomes self-sustaining, degrading the
+ *                 machine over minutes until it stops responding.
+ *   g_snap_gen  - the IORegistry generation the snapshot was built from. The
+ *                 registry topology only changes when hardware/drivers come and
+ *                 go, so if the generation is unchanged the snapshot is still
+ *                 accurate and we skip the rebuild entirely regardless of age.
+ *                 This turns steady-state operation from "rebuild every TTL
+ *                 forever" into "rebuild only when the device tree changes".
+ */
+static bool                    g_building    = false;
+static SInt32                  g_snap_gen    = 0;
+static bool                    g_snap_gen_valid = false;
+
+/*
+ * Asynchronous refresh.
+ *
+ * A vnop should not walk the IORegistry itself. A filesystem operation runs with
+ * VFS locks held (and a vnode iocount), while IORegistryIterator takes the
+ * global IOKit registry lock, which driver matching, power management and I/O
+ * completion all contend for. Taking a heavily contended global lock underneath
+ * VFS locks risks stalling threads while they hold vnodes, which in turn stalls
+ * any unmount (vflush() must reclaim every vnode). This was not the cause of the
+ * unmount freeze - that was heap corruption in release_node() - but keeping the
+ * traversal off the vnop path is the right structure regardless, and it is what
+ * makes the single-flight/generation throttling above meaningful.
+ *
+ * So the registry walk happens only in safe contexts: synchronously at mount
+ * (sysfs_iokit_prime), and thereafter on a thread_call. Vnops just read whatever
+ * snapshot is published - never allocating, never calling IOKit, never sleeping.
+ * A slightly stale snapshot is always preferable to blocking a vnop.
+ */
+static thread_call_t           g_refresh_call = nullptr;
+static bool                    g_refresh_pending = false;
+
+/*
+ * Diagnostic counters, exposed read-only via the sysfs.* sysctls (see sysfs.c).
+ * These exist to tell rebuild churn apart from a genuine allocation leak without
+ * having to guess: snap_builds is how many full snapshots have been built (it
+ * should stay nearly flat once the device tree settles), and snap_bytes is how
+ * much memory live snapshots currently hold (it should stay at roughly one
+ * snapshot's worth - continuous growth means snapshots are not being freed).
+ */
+extern "C" {
+    int64_t sysfs_stat_snap_builds = 0;
+    int64_t sysfs_stat_snap_bytes  = 0;
+}
 
 #pragma mark - allocation helpers
 
@@ -111,6 +172,9 @@ sysfs_snap_free(struct sysfs_snapshot *snap)
     }
     if (snap->hash != nullptr) {
         sysfs_free(snap->hash, (size_t)snap->hash_size * sizeof(*snap->hash));
+    }
+    if (snap->bytes != 0) {
+        OSAddAtomic64(-(int64_t)snap->bytes, &sysfs_stat_snap_bytes);
     }
     sysfs_free(snap, sizeof(*snap));
 }
@@ -212,6 +276,12 @@ sysfs_snap_build(void)
     snap->node_cap  = cap;
     snap->child_cap = cap;
     snap->hash_size = hsize;
+    snap->bytes = sizeof(*snap)
+                + (size_t)cap * sizeof(*snap->nodes)
+                + (size_t)cap * sizeof(*snap->child_idx)
+                + (size_t)hsize * sizeof(*snap->hash);
+    OSAddAtomic64((int64_t)snap->bytes, &sysfs_stat_snap_bytes);
+    OSAddAtomic64(1, &sysfs_stat_snap_builds);
     for (uint32_t i = 0; i < hsize; i++) {
         snap->hash[i].index = SYSFS_IDX_NONE;
     }
@@ -329,65 +399,96 @@ sysfs_snap_build(void)
     return snap;
 }
 
-/* Ensure a fresh-enough snapshot exists using RCU / Copy-on-Write double checking. */
+/*
+ * Ensure a usable snapshot exists, rebuilding only when it is genuinely needed
+ * and only ever on one thread at a time (see g_building / g_snap_gen above).
+ *
+ * Readers dereference g_snapshot only while holding g_lock, and a replaced
+ * snapshot is freed after the lock is dropped - by which point it is no longer
+ * reachable and no reader can still be inside the lock holding it.
+ */
+/*
+ * Do one registry walk and publish the result. Must only be called from a
+ * context that holds no VFS locks: the mount path, or the thread_call below.
+ */
+static void
+sysfs_snap_refresh(void)
+{
+    /* Sampled outside the lock: a plain read of a global counter. */
+    SInt32 gen = IORegistryEntry::getGenerationCount();
+
+    struct sysfs_snapshot *new_snap = sysfs_snap_build();
+
+    struct sysfs_snapshot *old_snap = nullptr;
+    IOLockLock(g_lock);
+    if (new_snap != nullptr) {
+        old_snap = g_snapshot;
+        g_snapshot = new_snap;
+        /*
+         * Record the generation sampled BEFORE the traversal: if the registry
+         * changed while we were walking it, this snapshot may already be
+         * incomplete, and the mismatch makes the next check schedule another
+         * refresh.
+         */
+        g_snap_gen = gen;
+        g_snap_gen_valid = true;
+    }
+    g_building = false;
+    g_refresh_pending = false;
+    /* Wake a teardown that is waiting for this refresh to drain. */
+    IOLockWakeup(g_lock, &g_building, false);
+    IOLockUnlock(g_lock);
+
+    /* Free the replaced snapshot outside the lock. */
+    sysfs_snap_free(old_snap);
+}
+
+/* thread_call entry point: the only place a refresh happens after mount. */
+static void
+sysfs_snap_refresh_cb(thread_call_param_t p0, thread_call_param_t p1)
+{
+    (void)p0;
+    (void)p1;
+    sysfs_snap_refresh();
+}
+
+/*
+ * Called from vnops. Strictly non-blocking: it never walks the registry, never
+ * allocates and never sleeps. If the published snapshot has gone stale it just
+ * schedules an asynchronous refresh and returns, leaving the caller to use the
+ * current (possibly slightly stale) snapshot.
+ */
 static void
 sysfs_snap_ensure(void)
 {
-    uint64_t now, elapsed_ns;
-    clock_get_uptime(&now);
-
-    struct sysfs_snapshot *old_snap = nullptr;
-    struct sysfs_snapshot *new_snap = nullptr;
-
-    /* Fast check under lock */
-    if (g_lock != nullptr) {
-        IOLockLock(g_lock);
-        if (g_snapshot != nullptr) {
-            absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
-            if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
-                IOLockUnlock(g_lock);
-                return;
-            }
-        }
-        IOLockUnlock(g_lock);
-    }
-
-    /* Build new snapshot UNLOCKED (heavy IOKit traversal & IOMalloc happen here) */
-    new_snap = sysfs_snap_build();
-    if (new_snap == nullptr) {
+    if (g_lock == nullptr) {
         return;
     }
 
-    /* Re-acquire lock to swap pointers safely */
-    if (g_lock != nullptr) {
-        IOLockLock(g_lock);
-        if (g_snapshot != nullptr) {
-            absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
-            if (elapsed_ns <= SYSFS_SNAP_TTL_NS) {
-                /* Another thread refreshed it while unlocked */
-                /* Throw away our snapshot, keep theirs */
-                old_snap = new_snap;
-                new_snap = nullptr;
-            } else {
-                old_snap = g_snapshot;
-                g_snapshot = new_snap;
-                new_snap = nullptr;
-            }
-        } else {
-            g_snapshot = new_snap;
-            new_snap = nullptr;
+    SInt32 gen = IORegistryEntry::getGenerationCount();
+
+    IOLockLock(g_lock);
+    if (g_snapshot != nullptr) {
+        uint64_t now, elapsed_ns;
+        clock_get_uptime(&now);
+        absolutetime_to_nanoseconds(now - g_snapshot->uptime, &elapsed_ns);
+
+        if ((g_snap_gen_valid && g_snap_gen == gen) ||
+            elapsed_ns <= SYSFS_SNAP_TTL_NS) {
+            IOLockUnlock(g_lock);
+            return;             /* registry unchanged, or still within the TTL */
         }
-        IOLockUnlock(g_lock);
-    } else {
-        /* No lock: we can’t safely publish, just discard */
-        old_snap = new_snap;
-        new_snap = nullptr;
     }
 
-    /* Free stale snapshot memory OUTSIDE the lock */
-    if (old_snap != nullptr) {
-        sysfs_snap_free(old_snap);
+    /* Stale (or absent): ask the worker to refresh, but do not wait for it. */
+    if (!g_refresh_pending && !g_building && g_refresh_call != nullptr) {
+        g_refresh_pending = true;
+        g_building = true;
+        IOLockUnlock(g_lock);
+        thread_call_enter(g_refresh_call);
+        return;
     }
+    IOLockUnlock(g_lock);
 }
 
 #pragma mark - display names
@@ -431,15 +532,68 @@ sysfs_iokit_init(void)
     if (g_lock == nullptr) {
         g_lock = IOLockAlloc();
     }
+    if (g_refresh_call == nullptr) {
+        g_refresh_call = thread_call_allocate(sysfs_snap_refresh_cb, nullptr);
+    }
+}
+
+/*
+ * Build the first snapshot synchronously. Called from the mount path, which is
+ * a safe context to walk the registry from (no VFS locks held, unlike a vnop),
+ * so /sys is usable immediately instead of returning empty until the first
+ * asynchronous refresh lands.
+ */
+extern "C" void
+sysfs_iokit_prime(void)
+{
+    if (g_lock == nullptr) {
+        return;
+    }
+    IOLockLock(g_lock);
+    bool have = (g_snapshot != nullptr) || g_building;
+    if (!have) {
+        g_building = true;
+    }
+    IOLockUnlock(g_lock);
+
+    if (!have) {
+        sysfs_snap_refresh();
+    }
 }
 
 extern "C" void
 sysfs_iokit_teardown(void)
 {
+    /*
+     * Stop the refresh worker BEFORE tearing anything down, and wait for an
+     * in-flight run to finish - it touches g_snapshot and g_lock.
+     *
+     * thread_call_cancel_wait() would do both in one call but is NOT in the
+     * third-party kext KPI export set (the kext fails to bind and will not
+     * load), so cancel any queued run and then wait for a running one on our own
+     * lock. Sleeping here is safe: this is the kext stop path, with no VFS locks
+     * held - unlike a vnop, which must never block (see the header comment).
+     */
+    if (g_refresh_call != nullptr) {
+        thread_call_cancel(g_refresh_call);
+        if (g_lock != nullptr) {
+            IOLockLock(g_lock);
+            while (g_building) {
+                IOLockSleep(g_lock, &g_building, THREAD_UNINT);
+            }
+            IOLockUnlock(g_lock);
+        }
+        thread_call_free(g_refresh_call);
+        g_refresh_call = nullptr;
+    }
+
     if (g_lock != nullptr) {
         IOLockLock(g_lock);
         struct sysfs_snapshot *old_snap = g_snapshot;
         g_snapshot = nullptr;
+        g_snap_gen_valid = false;
+        g_building = false;
+        g_refresh_pending = false;
         IOLockUnlock(g_lock);
         sysfs_snap_free(old_snap);
         IOLockFree(g_lock);

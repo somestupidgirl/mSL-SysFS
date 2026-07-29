@@ -20,6 +20,7 @@
 #include <sys/vnode.h>
 
 #include <fs/sysfs/sysfs.h>
+#include <fs/sysfs/sysfs_iokit.h>
 
 #pragma mark Local Definitions
 
@@ -199,6 +200,13 @@ sysfs_mount(struct mount *mp, __unused vnode_t devvp, user_addr_t data, __unused
          * Complete setup of sysfs data. Does nothing after first mount.
          */
         sysfs_structure_init();
+
+        /*
+         * Build the first IORegistry snapshot here, in the mount path: this is a
+         * safe context to walk the registry from. Vnops must never do it (see
+         * sysfs_iokit.cpp) - they only ever read the published snapshot.
+         */
+        sysfs_iokit_prime();
 
         /*
          * Initialize static data that is only required after an instance of the file
@@ -416,120 +424,14 @@ populate_vfs_attr(struct mount *mp, struct vfs_attr *fsap)
     VFSATTR_RETURN(fsap, f_fssubtype, 0);
 
     /*
-     * Volume capabilities and attribute support. This is what lets CoreServices
-     * (coreservicesd / the File Manager) handle /sys gracefully - the way it
-     * handles /dev (devfs) - instead of choking on the volume while building its
-     * File Manager "universe" at boot, which black-screens login (loginwindow
-     * aborts when it cannot check in with coreservicesd). Without this a
-     * synthetic volume advertises no capabilities and coreservicesd mishandles
-     * it. Modelled on devfs_vfs_getattr(); the crucial part is declaring, like
-     * devfs, that we have NO persistent object ids and NO path-from-id (both are
-     * marked valid but NOT set in capabilities), so coreservicesd never tries to
-     * build or walk a FileID tree over our deep, live /sys/devices content.
+     * NOTE: we deliberately do NOT advertise f_capabilities / f_attributes.
+     *
+     * An earlier attempt to fix a login hang declared a devfs-style capability
+     * set here. It never fixed anything, and it was actively wrong: it claimed
+     * VOL_CAP_INT_ATTRLIST plus a long list of ATTR_CMN and ATTR_VOL attributes
+     * while this filesystem implements no vnop_getattrlist at all, inviting
+     * callers to issue attribute requests we cannot answer. Leaving both
+     * unsupported makes VFS report conservative defaults, which is correct for a
+     * synthetic read-only filesystem.
      */
-    if (VFSATTR_IS_ACTIVE(fsap, f_capabilities)) {
-        vol_capabilities_attr_t *cap = &fsap->f_capabilities;
-
-        cap->capabilities[VOL_CAPABILITIES_FORMAT] =
-            VOL_CAP_FMT_SYMBOLICLINKS |
-            VOL_CAP_FMT_NO_ROOT_TIMES |
-            VOL_CAP_FMT_CASE_SENSITIVE |
-            VOL_CAP_FMT_CASE_PRESERVING |
-            VOL_CAP_FMT_FAST_STATFS |
-            VOL_CAP_FMT_2TB_FILESIZE |
-            VOL_CAP_FMT_HIDDEN_FILES |
-            VOL_CAP_FMT_NO_VOLUME_SIZES;
-        cap->capabilities[VOL_CAPABILITIES_INTERFACES] =
-            VOL_CAP_INT_ATTRLIST;
-        cap->capabilities[VOL_CAPABILITIES_RESERVED1] = 0;
-        cap->capabilities[VOL_CAPABILITIES_RESERVED2] = 0;
-
-        cap->valid[VOL_CAPABILITIES_FORMAT] =
-            VOL_CAP_FMT_PERSISTENTOBJECTIDS |
-            VOL_CAP_FMT_SYMBOLICLINKS |
-            VOL_CAP_FMT_HARDLINKS |
-            VOL_CAP_FMT_JOURNAL |
-            VOL_CAP_FMT_JOURNAL_ACTIVE |
-            VOL_CAP_FMT_NO_ROOT_TIMES |
-            VOL_CAP_FMT_SPARSE_FILES |
-            VOL_CAP_FMT_ZERO_RUNS |
-            VOL_CAP_FMT_CASE_SENSITIVE |
-            VOL_CAP_FMT_CASE_PRESERVING |
-            VOL_CAP_FMT_FAST_STATFS |
-            VOL_CAP_FMT_2TB_FILESIZE |
-            VOL_CAP_FMT_OPENDENYMODES |
-            VOL_CAP_FMT_HIDDEN_FILES |
-            VOL_CAP_FMT_PATH_FROM_ID |
-            VOL_CAP_FMT_NO_VOLUME_SIZES;
-        cap->valid[VOL_CAPABILITIES_INTERFACES] =
-            VOL_CAP_INT_SEARCHFS |
-            VOL_CAP_INT_ATTRLIST |
-            VOL_CAP_INT_NFSEXPORT |
-            VOL_CAP_INT_READDIRATTR |
-            VOL_CAP_INT_EXCHANGEDATA |
-            VOL_CAP_INT_COPYFILE |
-            VOL_CAP_INT_ALLOCATE |
-            VOL_CAP_INT_VOL_RENAME |
-            VOL_CAP_INT_ADVLOCK |
-            VOL_CAP_INT_FLOCK |
-            VOL_CAP_INT_EXTENDED_SECURITY |
-            VOL_CAP_INT_USERACCESS |
-            VOL_CAP_INT_MANLOCK |
-            VOL_CAP_INT_EXTENDED_ATTR |
-            VOL_CAP_INT_NAMEDSTREAMS;
-        cap->valid[VOL_CAPABILITIES_RESERVED1] = 0;
-        cap->valid[VOL_CAPABILITIES_RESERVED2] = 0;
-
-        VFSATTR_SET_SUPPORTED(fsap, f_capabilities);
-    }
-
-    if (VFSATTR_IS_ACTIVE(fsap, f_attributes)) {
-        vol_attributes_attr_t *attr = &fsap->f_attributes;
-
-        attr->validattr.commonattr =
-            ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_FSID |
-            ATTR_CMN_OBJTYPE | ATTR_CMN_OBJTAG | ATTR_CMN_OBJID |
-            ATTR_CMN_PAROBJID |
-            ATTR_CMN_MODTIME | ATTR_CMN_CHGTIME | ATTR_CMN_ACCTIME |
-            ATTR_CMN_OWNERID | ATTR_CMN_GRPID | ATTR_CMN_ACCESSMASK |
-            ATTR_CMN_FLAGS | ATTR_CMN_USERACCESS | ATTR_CMN_FILEID;
-        attr->validattr.volattr =
-            ATTR_VOL_FSTYPE | ATTR_VOL_SIZE | ATTR_VOL_SPACEFREE |
-            ATTR_VOL_SPACEAVAIL | ATTR_VOL_MINALLOCATION |
-            ATTR_VOL_OBJCOUNT | ATTR_VOL_MAXOBJCOUNT |
-            ATTR_VOL_MOUNTPOINT | ATTR_VOL_MOUNTFLAGS |
-            ATTR_VOL_MOUNTEDDEVICE | ATTR_VOL_CAPABILITIES |
-            ATTR_VOL_ATTRIBUTES;
-        attr->validattr.dirattr =
-            ATTR_DIR_LINKCOUNT | ATTR_DIR_MOUNTSTATUS;
-        attr->validattr.fileattr =
-            ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE |
-            ATTR_FILE_IOBLOCKSIZE | ATTR_FILE_DEVTYPE |
-            ATTR_FILE_DATALENGTH;
-        attr->validattr.forkattr = 0;
-
-        attr->nativeattr.commonattr =
-            ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_FSID |
-            ATTR_CMN_OBJTYPE | ATTR_CMN_OBJTAG | ATTR_CMN_OBJID |
-            ATTR_CMN_PAROBJID |
-            ATTR_CMN_MODTIME | ATTR_CMN_CHGTIME | ATTR_CMN_ACCTIME |
-            ATTR_CMN_OWNERID | ATTR_CMN_GRPID | ATTR_CMN_ACCESSMASK |
-            ATTR_CMN_FLAGS | ATTR_CMN_USERACCESS | ATTR_CMN_FILEID;
-        attr->nativeattr.volattr =
-            ATTR_VOL_FSTYPE | ATTR_VOL_SIZE | ATTR_VOL_SPACEFREE |
-            ATTR_VOL_SPACEAVAIL | ATTR_VOL_MINALLOCATION |
-            ATTR_VOL_OBJCOUNT | ATTR_VOL_MAXOBJCOUNT |
-            ATTR_VOL_MOUNTPOINT | ATTR_VOL_MOUNTFLAGS |
-            ATTR_VOL_MOUNTEDDEVICE | ATTR_VOL_CAPABILITIES |
-            ATTR_VOL_ATTRIBUTES;
-        attr->nativeattr.dirattr =
-            ATTR_DIR_MOUNTSTATUS;
-        attr->nativeattr.fileattr =
-            ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE |
-            ATTR_FILE_IOBLOCKSIZE | ATTR_FILE_DEVTYPE |
-            ATTR_FILE_DATALENGTH;
-        attr->nativeattr.forkattr = 0;
-
-        VFSATTR_SET_SUPPORTED(fsap, f_attributes);
-    }
 }

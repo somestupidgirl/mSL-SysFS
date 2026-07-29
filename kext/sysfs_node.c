@@ -7,6 +7,7 @@
  * Functions for the management of vnodes and sfsnodes.
  */
 #include <kern/assert.h>
+#include <libkern/OSAtomic.h>
 #include <libkern/OSMalloc.h>
 #include <sys/malloc.h>
 #include <sys/systm.h>
@@ -51,6 +52,15 @@ lck_mtx_t *sfsnode_hash_mutex = NULL;
  * Tag used for memory allocation.
  */
 OSMallocTag sysfs_osmalloc_tag = NULL;
+
+/*
+ * Diagnostic counter (exposed read-only as the sysfs.live_nodes sysctl, see
+ * sysfs.c): how many sfsnode_t are currently in the hash. Each corresponds to a
+ * live vnode, so this should plateau at the number of /sys paths in use and fall
+ * again as vnodes are reclaimed. Unbounded growth means vnodes are never being
+ * reclaimed (or nodes are being inserted without a matching free).
+ */
+int64_t sysfs_stat_live_nodes = 0;
 
 /*
  * Macro that gets the header of the bucket that corresponds to a given
@@ -189,6 +199,7 @@ sysfsnode_find(sfsmount_t *smp, sfsid_t node_id, sfssnode_t *snode,
                  * it belongs to.
                  */
                 LIST_INSERT_HEAD(hash_bucket, target_sfsnode, node_hash);
+                OSAddAtomic64(1, &sysfs_stat_live_nodes);
                 new_sfsnode_inserted = TRUE;
             }
         }
@@ -360,6 +371,7 @@ void
 sysfsnode_free_node(sfsnode_t *sfsnode)
 {
     LIST_REMOVE(sfsnode, node_hash);
+    OSAddAtomic64(-1, &sysfs_stat_live_nodes);
     OSFree(sfsnode, sizeof(sfsnode_t), sysfs_osmalloc_tag);
 }
 

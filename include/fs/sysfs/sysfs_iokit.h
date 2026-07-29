@@ -34,6 +34,13 @@ void sysfs_iokit_init(void);
 void sysfs_iokit_teardown(void);
 
 /*
+ * Build the first registry snapshot synchronously. Call from the mount path
+ * only: walking the registry is safe there (no VFS locks held), whereas doing it
+ * from a vnop inverts the VFS/IOKit lock order and wedges the system.
+ */
+void sysfs_iokit_prime(void);
+
+/*
  * 1 if a registry entry with this id currently exists (id 0, the devices root,
  * is always present).
  */
