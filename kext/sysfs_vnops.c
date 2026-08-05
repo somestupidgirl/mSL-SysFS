@@ -347,7 +347,29 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
              * distinguished by the matched regid/objectid.
              */
             uint64_t regid = dir_snp->node_id.nodeid_regid;
-            for (int a = 0; a < SYSFS_DEV_NATTRS; a++) {
+
+            /*
+             * Static children of /sys/devices itself (currently "system", the
+             * non-IOKit CPU/memory/NUMA hierarchy). These exist only at the
+             * devices root - a real registry entry has no static children - and
+             * take precedence, so a device that happened to be named "system"
+             * cannot shadow them. Once matched, the child is an ordinary static
+             * node and the normal static paths handle everything below it.
+             */
+            if (regid == SYSFS_NO_REGID && sysfs_dev_is_dir(dir_snp->node_id.nodeid_objectid)) {
+                sfssnode_t *static_child;
+                TAILQ_FOREACH(static_child, &dir_snode->ssn_children, ssn_next) {
+                    if (strcmp(name, static_child->ssn_name) == 0) {
+                        match_node = static_child;
+                        match_node_id.nodeid_base_id  = static_child->ssn_base_node_id;
+                        match_node_id.nodeid_regid    = SYSFS_NO_REGID;
+                        match_node_id.nodeid_objectid = SYSFS_NO_OBJECTID;
+                        break;
+                    }
+                }
+            }
+
+            for (int a = 0; match_node == NULL && a < SYSFS_DEV_NATTRS; a++) {
                 if (strcmp(name, sysfs_dev_attrs[a].name) == 0) {
                     match_node = dir_snode;
                     match_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
@@ -586,6 +608,33 @@ sysfs_devices_readdir(struct vnop_readdir_args *ap)
             numentries++;
         }
         nextpos += size;
+    }
+
+    /*
+     * Static children of /sys/devices itself (the non-IOKit "system" hierarchy).
+     * Only the devices root has them; emitted before the registry entries so the
+     * ordering matches lookup's precedence.
+     */
+    if (regid == SYSFS_NO_REGID) {
+        sfssnode_t *static_child;
+        TAILQ_FOREACH(static_child, &dir_snp->node_structure_node->ssn_children, ssn_next) {
+            if (uio_resid(uio) <= 0) {
+                break;
+            }
+            int size = sysfs_calc_dirent_size(static_child->ssn_name);
+            if (nextpos >= startpos) {
+                error = sysfs_copyout_dirent(
+                            sysfs_is_directory_type(static_child->ssn_node_type) ? DT_DIR : DT_REG,
+                            sysfs_get_fileid(SYSFS_NO_REGID, SYSFS_NO_OBJECTID,
+                                             static_child->ssn_base_node_id),
+                            static_child->ssn_name, uio, &size, nextpos + size);
+                if (size == 0 || error != 0) {
+                    goto done;
+                }
+                numentries++;
+            }
+            nextpos += size;
+        }
     }
 
     /* Child registry entries, one subdirectory each. */

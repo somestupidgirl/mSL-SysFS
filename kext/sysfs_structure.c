@@ -38,6 +38,9 @@ STATIC sfssnode_t *add_node(sfssnode_t *parent, const char *name, sfstype type, 
 STATIC sfssnode_t *add_directory(sfssnode_t *parent, const char *name, sfstype type, sfsbaseid_t node_id, uint16_t flags, boolean_t raw,
                         sysfs_node_size_fn node_size_fn, sysfs_read_data_fn node_read_data_fn);
 
+STATIC sfssnode_t *add_file(sfssnode_t *parent, const char *name, sfsbaseid_t node_id, uint16_t flags, size_t size,
+                        sysfs_node_size_fn node_size_fn, sysfs_read_data_fn node_read_data_fn);
+
 STATIC void release_node(sfssnode_t *root);
 
 /*
@@ -128,7 +131,49 @@ sysfs_structure_init(void)
          * has no static "."/".." children - the dynamic readdir emits those
          * itself (see sysfs_devices_readdir), exactly as procfs does for /proc/sys.
          */
-        (void)add_node(root_node, "devices", SFSdevice, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+        sfssnode_t *devices_node =
+            add_node(root_node, "devices", SFSdevice, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+
+        /*
+         * /sys/devices/system - Linux's "system" pseudo-bus. Unlike the rest of
+         * /sys/devices this is NOT part of the IOKit mirror: on Linux it is a
+         * synthetic hierarchy describing CPUs, memory and NUMA nodes, so it is
+         * built here as ordinary static structure nodes. The SFSdevice lookup and
+         * readdir paths consult these static children alongside the registry
+         * ones, but only at the /sys/devices root (registry id 0).
+         *
+         * macOS is not NUMA, so there is exactly one node, node0.
+         */
+        sfssnode_t *system_dir = add_directory(devices_node, "system",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *node_dir   = add_directory(system_dir, "node",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *node0_dir  = add_directory(node_dir, "node0",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+
+        /*
+         * node0/hugepages/hugepages-<size>kB/. The huge-page size is 2MB on both
+         * Apple Silicon and Intel Macs (the architectural large-page size; the
+         * base page is 16KB on arm64 and 4KB on x86_64), so the directory is
+         * named for 2048kB on either.
+         *
+         * macOS has no hugetlb pool to size, reserve or overcommit - large pages
+         * are managed transparently by the VM - so all three counters read 0,
+         * exactly as on a Linux host where no huge pages have been allocated.
+         * Per-node hugepages directories expose these three files only; the
+         * resv_/nr_overcommit_ counters are global (/sys/kernel/mm/hugepages).
+         */
+        sfssnode_t *hugepages_dir = add_directory(node0_dir, "hugepages",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *hp_2m_dir = add_directory(hugepages_dir, "hugepages-2048kB",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+
+        add_file(hp_2m_dir, "nr_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(hp_2m_dir, "free_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(hp_2m_dir, "surplus_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
         (void)add_directory(root_node, "firmware",   SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "fs",         SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "hypervisor", SFSdir, next_node_id++, 0, 0, NULL, NULL);
@@ -229,6 +274,17 @@ add_directory(sfssnode_t *parent, const char *name, sfstype type, sfsbaseid_t no
         add_directory(snode, "..", SFSdirparent, next_node_id++, flags & SSN_FLAG_DYNAMIC, 1, NULL, NULL);
     }
     return snode;
+}
+
+/*
+ * Adds a file to the file system structure. Files are always leaf elements
+ * (although that is not checked).
+ */
+STATIC sfssnode_t *
+add_file(sfssnode_t *parent, const char *name, sfsbaseid_t node_id, uint16_t flags, size_t size,
+            sysfs_node_size_fn node_size_fn, sysfs_read_data_fn node_read_data_fn)
+{
+    return add_node(parent, name, SFSfile, node_id, flags, size, node_size_fn, node_read_data_fn);
 }
 
 #pragma mark -

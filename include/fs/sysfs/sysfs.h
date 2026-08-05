@@ -430,6 +430,16 @@ extern uint64_t   sysfs_get_fileid(uint64_t regid, uint64_t objectid, sfsbaseid_
 extern int        sysfs_atoi(const char *p, const char **end_ptr);
 extern size_t     sysfs_get_node_size_attr(sfsnode_t *snp, kauth_cred_t creds);
 
+/*
+ * Content for /sys/devices/system (sysfs_system.c).
+ *
+ * sysfs_do_zero_count renders an always-zero counter as Linux renders a sysfs
+ * integer attribute ("0\n"); SYSFS_ZERO_COUNT_LEN is the length it produces, so
+ * a node using it can report the right size without a size function.
+ */
+#define SYSFS_ZERO_COUNT_LEN 2
+extern int sysfs_do_zero_count(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+
 #endif /* __FSBUNDLE__ */
 
 #endif /* sysfs_h */
