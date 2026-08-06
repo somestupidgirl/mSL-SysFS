@@ -440,6 +440,20 @@ extern size_t     sysfs_get_node_size_attr(sfsnode_t *snp, kauth_cred_t creds);
 #define SYSFS_ZERO_COUNT_LEN 2
 extern int sysfs_do_zero_count(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 
+/*
+ * The remaining /sys/devices/system content. These render at read time, so their
+ * nodes carry no fixed ssn_node_size; stat() reports 0 for them, which is what
+ * Linux's own sysfs attribute files report (they are generated on read, and
+ * every tool reads them to EOF rather than trusting st_size).
+ */
+extern int sysfs_do_cpulist(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpumap(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_node_meminfo(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_node_distance(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_node_numastat(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_node_list(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpu_kernel_max(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+
 #endif /* __FSBUNDLE__ */
 
 #endif /* sysfs_h */

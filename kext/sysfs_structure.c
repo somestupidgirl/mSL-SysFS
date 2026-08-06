@@ -174,6 +174,38 @@ sysfs_structure_init(void)
                         SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
         add_file(hp_2m_dir, "surplus_hugepages", next_node_id++, 0,
                         SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+
+        /*
+         * The rest of node0's standard attributes. Everything belongs to the one
+         * node, so the CPU set is every CPU and the distance matrix is just the
+         * self-distance.
+         */
+        add_file(node0_dir, "cpulist",  next_node_id++, 0, 0, NULL, sysfs_do_cpulist);
+        add_file(node0_dir, "cpumap",   next_node_id++, 0, 0, NULL, sysfs_do_cpumap);
+        add_file(node0_dir, "meminfo",  next_node_id++, 0, 0, NULL, sysfs_do_node_meminfo);
+        add_file(node0_dir, "distance", next_node_id++, 0, 0, NULL, sysfs_do_node_distance);
+        add_file(node0_dir, "numastat", next_node_id++, 0, 0, NULL, sysfs_do_node_numastat);
+
+        /*
+         * The node-set files that live beside the nodeN directories. One node,
+         * which has both CPUs and memory, so each of these reads "0".
+         */
+        add_file(node_dir, "online",     next_node_id++, 0, 0, NULL, sysfs_do_node_list);
+        add_file(node_dir, "possible",   next_node_id++, 0, 0, NULL, sysfs_do_node_list);
+        add_file(node_dir, "has_cpu",    next_node_id++, 0, 0, NULL, sysfs_do_node_list);
+        add_file(node_dir, "has_memory", next_node_id++, 0, 0, NULL, sysfs_do_node_list);
+
+        /*
+         * /sys/devices/system/cpu - the CPU topology sets. macOS never
+         * hot-unplugs a core, so online == possible == present == every CPU.
+         */
+        sfssnode_t *cpu_dir = add_directory(system_dir, "cpu",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        add_file(cpu_dir, "online",     next_node_id++, 0, 0, NULL, sysfs_do_cpulist);
+        add_file(cpu_dir, "possible",   next_node_id++, 0, 0, NULL, sysfs_do_cpulist);
+        add_file(cpu_dir, "present",    next_node_id++, 0, 0, NULL, sysfs_do_cpulist);
+        add_file(cpu_dir, "offline",    next_node_id++, 0, 0, NULL, sysfs_do_zero_count);
+        add_file(cpu_dir, "kernel_max", next_node_id++, 0, 0, NULL, sysfs_do_cpu_kernel_max);
         (void)add_directory(root_node, "firmware",   SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "fs",         SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "hypervisor", SFSdir, next_node_id++, 0, 0, NULL, NULL);
