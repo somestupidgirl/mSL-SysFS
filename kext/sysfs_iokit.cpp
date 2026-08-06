@@ -55,6 +55,17 @@ struct sysfs_snap_node {
     uint64_t parent_regid;    /* 0 == root */
     uint32_t first_child;     /* index into g_child_idx */
     uint32_t num_children;
+    /*
+     * How many earlier siblings share this node's IOKit name: 0 means the name
+     * is unique among its siblings and is used bare, N>0 means it is presented
+     * as "<name>@N". Computed once when the snapshot is built (below) rather
+     * than per query - working it out on demand meant every child_at() and
+     * child_named() rescanned all earlier siblings, making a readdir or a path
+     * lookup O(children^2) in strcmp with the snapshot lock held. On the wide
+     * directories the IORegistry actually has, that lock hold was long enough to
+     * stall every other process touching /sys.
+     */
+    uint32_t dup_ordinal;
     char     name[SYSFS_IOKIT_NAMEMAX];   /* base IOKit name */
 };
 
@@ -395,6 +406,29 @@ sysfs_snap_build(void)
     }
 
     sysfs_free(child_counts, (size_t)count * sizeof(uint64_t));
+
+    /*
+     * Precompute each child's name-disambiguation ordinal. This is the same
+     * O(siblings^2) comparison as before, but it now happens exactly once, here
+     * on the refresh path, instead of on every lookup and every readdir entry
+     * with the lock held.
+     */
+    for (uint32_t p = 0; p < count; p++) {
+        uint32_t base = snap->nodes[p].first_child;
+        uint32_t n    = snap->nodes[p].num_children;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t ci = snap->child_idx[base + i];
+            uint32_t dup = 0;
+            for (uint32_t k = 0; k < i; k++) {
+                uint32_t sib = snap->child_idx[base + k];
+                if (strcmp(snap->nodes[sib].name, snap->nodes[ci].name) == 0) {
+                    dup++;
+                }
+            }
+            snap->nodes[ci].dup_ordinal = dup;
+        }
+    }
+
     clock_get_uptime(&snap->uptime);
     return snap;
 }
@@ -508,13 +542,7 @@ sysfs_child_display(const struct sysfs_snapshot *snap, uint32_t pidx, uint32_t i
     uint32_t ci = snap->child_idx[base + index];
     const char *nm = snap->nodes[ci].name;
 
-    uint32_t dup = 0;
-    for (uint32_t k = 0; k < index; k++) {
-        uint32_t sib = snap->child_idx[base + k];
-        if (strcmp(snap->nodes[sib].name, nm) == 0) {
-            dup++;
-        }
-    }
+    uint32_t dup = snap->nodes[ci].dup_ordinal;
     if (dup == 0) {
         strlcpy(buf, nm, buflen);
     } else {
