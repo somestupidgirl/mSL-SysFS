@@ -369,7 +369,7 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
                 }
             }
 
-            for (int a = 0; match_node == NULL && a < SYSFS_DEV_NATTRS; a++) {
+            for (int a = 0; regid != SYSFS_NO_REGID && match_node == NULL && a < SYSFS_DEV_NATTRS; a++) {
                 if (strcmp(name, sysfs_dev_attrs[a].name) == 0) {
                     match_node = dir_snode;
                     match_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
@@ -555,6 +555,17 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
     *ap->a_eofflag = snode == NULL; // EOF if we handled the last entry
     *ap->a_numdirent = numentries;
 
+    /*
+     * If nothing was emitted and this is not end-of-directory, the caller's
+     * buffer was too small for even one entry. Returning 0 entries with
+     * eofflag clear and the offset unmoved would make it ask again with the
+     * same buffer forever - an unkillable spin in whatever process is reading
+     * the directory. Report EINVAL instead, as XNU's own filesystems do.
+     */
+    if (error == 0 && numentries == 0 && *ap->a_eofflag == 0) {
+        error = EINVAL;
+    }
+
     return error;
 }
 
@@ -594,8 +605,12 @@ sysfs_devices_readdir(struct vnop_readdir_args *ap)
         nextpos += size;
     }
 
-    /* Attribute files (name, ...). */
-    for (int a = 0; a < SYSFS_DEV_NATTRS && uio_resid(uio) > 0; a++) {
+    /*
+     * Attribute files (name, ...). These describe a device, so they exist only
+     * on real registry entries - the /sys/devices root is a container, and Linux
+     * has no /sys/devices/name.
+     */
+    for (int a = 0; regid != SYSFS_NO_REGID && a < SYSFS_DEV_NATTRS && uio_resid(uio) > 0; a++) {
         const char *nm = sysfs_dev_attrs[a].name;
         int size = sysfs_calc_dirent_size(nm);
         if (nextpos >= startpos) {
@@ -662,6 +677,18 @@ done:
     uio_setoffset(uio, nextpos);
     *ap->a_eofflag   = (error == 0 && exhausted) ? 1 : 0;
     *ap->a_numdirent = numentries;
+
+    /*
+     * If nothing was emitted and this is not end-of-directory, the caller's
+     * buffer was too small for even one entry. Returning 0 entries with
+     * eofflag clear and the offset unmoved would make it ask again with the
+     * same buffer forever - an unkillable spin in whatever process is reading
+     * the directory. Report EINVAL instead, as XNU's own filesystems do.
+     */
+    if (error == 0 && numentries == 0 && *ap->a_eofflag == 0) {
+        error = EINVAL;
+    }
+
     return error;
 }
 
