@@ -46,6 +46,19 @@ extern "C" {
 /* How long a snapshot is reused before a rebuild (ns). */
 #define SYSFS_SNAP_TTL_NS     2000000000ULL   /* 2 seconds */
 
+/*
+ * Hard floor between two snapshot rebuilds, whatever the registry generation
+ * says. A rebuild walks the entire service plane, and every step of that walk
+ * takes IOKit's registry locks - the same locks driver matching, power
+ * management and HID input delivery need. Shortly after login the generation
+ * count changes constantly as drivers attach, so gating rebuilds purely on the
+ * generation meant a fresh full traversal on nearly every touch of /sys. That
+ * surfaced as short system-wide stalls: apps slow to launch, builds not
+ * finishing, even keyboard input hitching. The device tree does not change
+ * interestingly enough to justify re-reading it that often.
+ */
+#define SYSFS_SNAP_MIN_REBUILD_NS 30000000000ULL  /* 30 seconds */
+
 #define SYSFS_IDX_NONE        0xFFFFFFFFu
 
 /* One node in the snapshot. Node 0 is the synthetic root (regid 0 == the
@@ -114,6 +127,19 @@ static struct sysfs_snapshot  *g_snapshot    = nullptr;
 static bool                    g_building    = false;
 static SInt32                  g_snap_gen    = 0;
 static bool                    g_snap_gen_valid = false;
+
+/* Uptime at which the last build completed, for the rate limit above. */
+static uint64_t                g_last_build_uptime = 0;
+static bool                    g_last_build_valid  = false;
+
+/*
+ * Node count of the last snapshot, used to size the next one. Sizing from the
+ * previous result removes an entire second traversal per rebuild: the build used
+ * to walk the whole service plane once purely to count it, then again to record
+ * it, doubling the registry-lock traffic to learn a number the previous
+ * snapshot already knew.
+ */
+static uint32_t                g_last_node_count = 0;
 
 /*
  * Asynchronous refresh.
@@ -267,9 +293,23 @@ sysfs_snap_build(void)
         return nullptr;
     }
 
-    uint32_t maxe = sysfs_count_entries();          /* upper bound (dups possible) */
-    uint32_t buffer = (maxe / 10) + 32;             /* Small adaptive buffer for dynamic nodes attached mid-scan */
+    /*
+     * Size from the previous snapshot rather than counting the registry again.
+     * The count was a second full recursive traversal - as expensive as the
+     * build itself - to learn a number the last snapshot already knew, so only
+     * the very first build pays for it. The margin absorbs devices attaching
+     * between builds; if it is ever not enough the walk below stops at the cap
+     * and the next rebuild starts from a doubled estimate, so a burst of new
+     * devices costs freshness briefly rather than truncating for good.
+     */
+    uint32_t maxe = (g_last_node_count != 0)
+        ? g_last_node_count
+        : sysfs_count_entries();
+    uint32_t buffer = (maxe / 4) + 64;              /* room for mid-scan attachments */
     uint32_t cap = maxe + buffer + 1;               /* +1 for synthetic root */
+    if (cap > SYSFS_IOKIT_MAXNODES) {
+        cap = SYSFS_IOKIT_MAXNODES;
+    }
 
     /* Power-of-two hash table, >= 2x capacity, min 16. */
     uint32_t hsize = 16;
@@ -337,6 +377,16 @@ sysfs_snap_build(void)
         it->release();
     }
     snap->node_count = count;
+
+    /*
+     * If the walk filled the table the estimate was too small, so this snapshot
+     * is truncated. Grow the estimate and let the next rebuild pick up the rest
+     * rather than staying short forever.
+     */
+    if (count >= cap && cap < SYSFS_IOKIT_MAXNODES) {
+        uint32_t grown = cap * 2;
+        g_last_node_count = (grown > SYSFS_IOKIT_MAXNODES) ? SYSFS_IOKIT_MAXNODES : grown;
+    }
 
     /* Build CSR child lists: count, prefix-sum, fill. A node's parent maps to a
      * node index via the hash (parent_regid 0 -> root at index 0); an orphan
@@ -466,6 +516,9 @@ sysfs_snap_refresh(void)
          */
         g_snap_gen = gen;
         g_snap_gen_valid = true;
+        g_last_node_count = new_snap->node_count;
+        clock_get_uptime(&g_last_build_uptime);
+        g_last_build_valid = true;
     }
     g_building = false;
     g_refresh_pending = false;
@@ -514,7 +567,22 @@ sysfs_snap_ensure(void)
         }
     }
 
-    /* Stale (or absent): ask the worker to refresh, but do not wait for it. */
+    /*
+     * Stale (or absent). Ask the worker to refresh - but not if we rebuilt
+     * recently, unless there is no snapshot at all to serve from. Serving
+     * slightly out-of-date device topology costs nothing; re-walking the
+     * registry every time a driver attaches costs the whole system.
+     */
+    if (g_snapshot != nullptr && g_last_build_valid) {
+        uint64_t now, since_ns;
+        clock_get_uptime(&now);
+        absolutetime_to_nanoseconds(now - g_last_build_uptime, &since_ns);
+        if (since_ns < SYSFS_SNAP_MIN_REBUILD_NS) {
+            IOLockUnlock(g_lock);
+            return;
+        }
+    }
+
     if (!g_refresh_pending && !g_building && g_refresh_call != nullptr) {
         g_refresh_pending = true;
         g_building = true;
@@ -621,6 +689,14 @@ sysfs_iokit_teardown(void)
         g_snapshot = nullptr;
         g_snap_gen_valid = false;
         g_building = false;
+        /*
+         * Reset the rate-limit and sizing state too, so a reload starts clean
+         * rather than inheriting a stale build timestamp (which would suppress
+         * the first refresh) or a node-count estimate from the previous load.
+         */
+        g_last_build_valid = false;
+        g_last_build_uptime = 0;
+        g_last_node_count = 0;
         g_refresh_pending = false;
         IOLockUnlock(g_lock);
         sysfs_snap_free(old_snap);
