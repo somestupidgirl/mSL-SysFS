@@ -78,6 +78,42 @@ int sysfs_iokit_parent(uint64_t regid, uint64_t *parent_regid);
  */
 size_t sysfs_iokit_name(uint64_t regid, char *buf, size_t buflen);
 
+/*
+ * Device classes.
+ *
+ * Linux groups devices by class under /sys/class/<class>/<device>, where each
+ * entry is a symlink into /sys/devices. IOKit has the same notion - a registry
+ * entry's class - so membership is decided once, while the snapshot is built,
+ * by testing each entry against the IOKit class that corresponds to the Linux
+ * one. Only devices with a BSD name are listed, since that name is what Linux
+ * calls the device (en0, disk0s1, ...) and what makes the entry addressable.
+ */
+#define SYSFS_CLASS_NONE   0
+#define SYSFS_CLASS_NET    1   /* IONetworkInterface  -> class/net    */
+#define SYSFS_CLASS_BLOCK  2   /* IOMedia             -> class/block  */
+#define SYSFS_CLASS_TTY    3   /* IOSerialBSDClient   -> class/tty    */
+#define SYSFS_CLASS_POWER  4   /* IOPMPowerSource     -> class/power_supply */
+#define SYSFS_CLASS_COUNT  5
+
+/*
+ * Enumerate the members of a class. sysfs_iokit_class_child_at fills namebuf
+ * with the index-th member's device name and *regid with its entry id, and
+ * returns 1 while members remain. sysfs_iokit_class_child_named resolves one by
+ * name. Both read the published snapshot, so they never touch IOKit directly.
+ */
+int sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
+                               char *namebuf, size_t buflen, uint64_t *regid);
+int sysfs_iokit_class_child_named(uint32_t class_id, const char *name,
+                                  size_t namelen, uint64_t *regid);
+
+/*
+ * Build the path of an entry relative to the /sys/devices root, e.g.
+ * "J813AP/arm-io@10F00000/usb-drd0". Returns the length written, or 0 if the
+ * entry is unknown or the path does not fit. This is what a /sys/class symlink
+ * resolves to, prefixed with the right number of "../" segments by the caller.
+ */
+size_t sysfs_iokit_path(uint64_t regid, char *buf, size_t buflen);
+
 #ifdef __cplusplus
 }
 #endif

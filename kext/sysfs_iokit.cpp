@@ -41,6 +41,8 @@ extern "C" {
 
 /* Upper bound on an IOKit entry name we store. */
 #define SYSFS_IOKIT_NAMEMAX   128
+/* Upper bound on a BSD device name (en0, disk0s1, tty.usbserial-...). */
+#define SYSFS_IOKIT_BSDNAMEMAX 32
 /* Sanity cap on service-plane entries in one snapshot. */
 #define SYSFS_IOKIT_MAXNODES  16384u
 /* How long a snapshot is reused before a rebuild (ns). */
@@ -61,6 +63,9 @@ extern "C" {
 
 #define SYSFS_IDX_NONE        0xFFFFFFFFu
 
+/* Deepest device path we will render for a /sys/class symlink target. */
+#define SYSFS_IOKIT_PATHDEPTH 64
+
 /* One node in the snapshot. Node 0 is the synthetic root (regid 0 == the
  * /sys/devices container); nodes 1.. are real service-plane entries. */
 struct sysfs_snap_node {
@@ -79,6 +84,14 @@ struct sysfs_snap_node {
      * stall every other process touching /sys.
      */
     uint32_t dup_ordinal;
+    /*
+     * Which /sys/class this entry belongs to (SYSFS_CLASS_*), and the BSD device
+     * name Linux would call it by. Both are resolved once here, while the
+     * snapshot is built, because deciding class membership means asking IOKit
+     * about the object - which a vnop must never do.
+     */
+    uint32_t class_id;
+    char     bsdname[SYSFS_IOKIT_BSDNAMEMAX];
     char     name[SYSFS_IOKIT_NAMEMAX];   /* base IOKit name */
 };
 
@@ -371,6 +384,37 @@ sysfs_snap_build(void)
             nd->num_children = 0;
             const char *nm = e->getName(gIOServicePlane);
             strlcpy(nd->name, nm != nullptr ? nm : "unknown", sizeof(nd->name));
+
+            /*
+             * Class membership. metaCast() matches by class name, so this needs
+             * no link-time dependency on IONetworkingFamily, IOStorageFamily and
+             * friends - only the base IOKit KPI we already use. A device is only
+             * listed in a class if it also has a BSD name, since that name is
+             * what Linux calls it and what the /sys/class entry is named.
+             */
+            nd->class_id = SYSFS_CLASS_NONE;
+            nd->bsdname[0] = '\0';
+            uint32_t cls = SYSFS_CLASS_NONE;
+            if (e->metaCast("IOMedia") != nullptr) {
+                cls = SYSFS_CLASS_BLOCK;
+            } else if (e->metaCast("IONetworkInterface") != nullptr) {
+                cls = SYSFS_CLASS_NET;
+            } else if (e->metaCast("IOSerialBSDClient") != nullptr) {
+                cls = SYSFS_CLASS_TTY;
+            } else if (e->metaCast("IOPMPowerSource") != nullptr) {
+                cls = SYSFS_CLASS_POWER;
+            }
+            if (cls != SYSFS_CLASS_NONE) {
+                OSString *bsd = OSDynamicCast(OSString, e->getProperty("BSD Name"));
+                if (bsd != nullptr) {
+                    strlcpy(nd->bsdname, bsd->getCStringNoCopy(), sizeof(nd->bsdname));
+                    nd->class_id = cls;
+                } else if (cls == SYSFS_CLASS_POWER) {
+                    /* Power sources have no BSD name; use the IOKit name. */
+                    strlcpy(nd->bsdname, nd->name, sizeof(nd->bsdname));
+                    nd->class_id = cls;
+                }
+            }
             sysfs_hash_insert(snap, regid, count);
             count++;
         }
@@ -792,6 +836,120 @@ sysfs_iokit_parent(uint64_t regid, uint64_t *parent_regid)
     }
     IOLockUnlock(g_lock);
     return ok;
+}
+
+extern "C" int
+sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
+                           char *namebuf, size_t buflen, uint64_t *regid)
+{
+    if (namebuf == nullptr || regid == nullptr || buflen == 0 || g_lock == nullptr) {
+        return 0;
+    }
+    sysfs_snap_ensure();
+    IOLockLock(g_lock);
+    int ok = 0;
+    if (g_snapshot != nullptr) {
+        /*
+         * Linear scan of the snapshot. Class membership is sparse (a handful of
+         * disks and interfaces out of thousands of entries), and the alternative
+         * - a per-class index - would have to be rebuilt with every snapshot for
+         * directories that are read rarely. The scan is over plain memory with
+         * no IOKit involvement, so it is cheap even at a few thousand nodes.
+         */
+        unsigned int seen = 0;
+        for (uint32_t i = 1; i < g_snapshot->node_count; i++) {
+            if (g_snapshot->nodes[i].class_id != class_id) {
+                continue;
+            }
+            if (seen == index) {
+                strlcpy(namebuf, g_snapshot->nodes[i].bsdname, buflen);
+                *regid = g_snapshot->nodes[i].regid;
+                ok = 1;
+                break;
+            }
+            seen++;
+        }
+    }
+    IOLockUnlock(g_lock);
+    return ok;
+}
+
+extern "C" int
+sysfs_iokit_class_child_named(uint32_t class_id, const char *name,
+                              size_t namelen, uint64_t *regid)
+{
+    if (name == nullptr || regid == nullptr || g_lock == nullptr) {
+        return 0;
+    }
+    sysfs_snap_ensure();
+    IOLockLock(g_lock);
+    int found = 0;
+    if (g_snapshot != nullptr) {
+        for (uint32_t i = 1; i < g_snapshot->node_count; i++) {
+            const struct sysfs_snap_node *nd = &g_snapshot->nodes[i];
+            if (nd->class_id != class_id) {
+                continue;
+            }
+            if (strlen(nd->bsdname) == namelen &&
+                strncmp(nd->bsdname, name, namelen) == 0) {
+                *regid = nd->regid;
+                found = 1;
+                break;
+            }
+        }
+    }
+    IOLockUnlock(g_lock);
+    return found;
+}
+
+extern "C" size_t
+sysfs_iokit_path(uint64_t regid, char *buf, size_t buflen)
+{
+    if (buf == nullptr || buflen == 0 || g_lock == nullptr) {
+        return 0;
+    }
+    buf[0] = '\0';
+    if (regid == 0) {
+        return 0;               /* the devices root itself has no path below it */
+    }
+
+    /*
+     * Walk up to the root collecting indices, then emit them in reverse. The
+     * chain is bounded by the node count, so a snapshot that somehow contained a
+     * cycle cannot spin here.
+     */
+    uint32_t chain[SYSFS_IOKIT_PATHDEPTH];
+    uint32_t depth = 0;
+    size_t written = 0;
+
+    IOLockLock(g_lock);
+    if (g_snapshot != nullptr) {
+        uint32_t idx = sysfs_hash_find(g_snapshot, regid);
+        while (idx != SYSFS_IDX_NONE && idx != 0 && depth < SYSFS_IOKIT_PATHDEPTH) {
+            chain[depth++] = idx;
+            idx = sysfs_hash_find(g_snapshot, g_snapshot->nodes[idx].parent_regid);
+        }
+
+        for (uint32_t d = depth; d > 0; d--) {
+            const struct sysfs_snap_node *nd = &g_snapshot->nodes[chain[d - 1]];
+            int n;
+            if (nd->dup_ordinal == 0) {
+                n = snprintf(buf + written, buflen - written, "%s%s",
+                             (written == 0) ? "" : "/", nd->name);
+            } else {
+                n = snprintf(buf + written, buflen - written, "%s%s@%u",
+                             (written == 0) ? "" : "/", nd->name, nd->dup_ordinal);
+            }
+            if (n <= 0 || (size_t)n >= buflen - written) {
+                written = 0;    /* does not fit; report failure rather than a truncated path */
+                buf[0] = '\0';
+                break;
+            }
+            written += (size_t)n;
+        }
+    }
+    IOLockUnlock(g_lock);
+    return written;
 }
 
 extern "C" size_t

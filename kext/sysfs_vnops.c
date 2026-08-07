@@ -82,6 +82,22 @@ static const int NAME_BUFFER_SIZE = MAX_STRUCT_NODE_NAME_LEN;
 /* Upper bound on an attribute file's value (IOKit names are well under this). */
 #define SYSFS_ATTR_VALUE_MAX  256
 
+/* Longest /sys/class symlink target we will render. */
+#define SYSFS_LINK_TARGET_MAX 1024
+
+/*
+ * A directory whose contents are the members of a device class
+ * (/sys/class/net, /sys/block, ...). The class is carried in ssn_instance; the
+ * entries are symlinks into /sys/devices, resolved by vnop_readlink.
+ */
+static inline boolean_t
+sysfs_is_class_dir(const sfssnode_t *snode)
+{
+    return (snode->ssn_flags & SSN_FLAG_DYNAMIC) != 0 &&
+           snode->ssn_node_type == SFSdir &&
+           snode->ssn_instance != SYSFS_CLASS_NONE;
+}
+
 static inline boolean_t
 sysfs_dev_is_dir(uint64_t objectid)
 {
@@ -123,8 +139,10 @@ STATIC inline int sysfs_calc_dirent_size(const char *name);
 STATIC int sysfs_copyout_dirent(int type, uint64_t file_id, const char *name, uio_t uio, int *sizep, off_t seekoff);
 STATIC int sysfs_create_vnode(sysfs_vnode_create_args *cap, sfsnode_t *snp, vnode_t *vpp);
 STATIC int sysfs_devices_readdir(struct vnop_readdir_args *ap);
+STATIC int sysfs_class_readdir(struct vnop_readdir_args *ap);
 STATIC int sysfs_device_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio);
 STATIC size_t sysfs_device_attr_size(sfsnode_t *snp);
+STATIC int sysfs_link_target(sfsnode_t *snp, char *buf, size_t buflen);
 
 #pragma mark -
 #pragma mark Vnode Operations Structures
@@ -403,7 +421,28 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
         sfssnode_t *match_node = NULL;
         sfsid_t match_node_id = { 0 };
 
-        if (dir_snode->ssn_node_type == SFSdevice) {
+        if (sysfs_is_class_dir(dir_snode)) {
+            /*
+             * A class directory's entries are not structure children - they are
+             * whichever devices currently belong to the class. The matched entry
+             * reuses the shared SFSlink child, distinguished by the device's
+             * registry id in the node id.
+             */
+            uint64_t dev_regid = 0;
+            if (sysfs_iokit_class_child_named(dir_snode->ssn_instance, name,
+                                              (size_t)cnp->cn_namelen, &dev_regid)) {
+                sfssnode_t *link = TAILQ_FIRST(&dir_snode->ssn_children);
+                while (link != NULL && link->ssn_node_type != SFSlink) {
+                    link = TAILQ_NEXT(link, ssn_next);
+                }
+                if (link != NULL) {
+                    match_node = link;
+                    match_node_id.nodeid_base_id  = link->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = dev_regid;
+                    match_node_id.nodeid_objectid = SYSFS_NO_OBJECTID;
+                }
+            }
+        } else if (dir_snode->ssn_node_type == SFSdevice) {
             /*
              * /sys/devices entries are dynamic: match the name against this
              * entry's attribute files first, then its child registry entries
@@ -529,6 +568,13 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
      */
     if (dir_snode->ssn_node_type == SFSdevice) {
         return sysfs_devices_readdir(ap);
+    }
+
+    /*
+     * Class directories enumerate their members, not static children.
+     */
+    if (sysfs_is_class_dir(dir_snode)) {
+        return sysfs_class_readdir(ap);
     }
 
     int numentries = 0;
@@ -758,6 +804,77 @@ done:
 }
 
 /*
+ * Readdir for a device-class directory (/sys/class/net, /sys/block, ...): "."
+ * and "..", then one symlink per member of the class. Same offset and EOF
+ * accounting as the other readdir paths - restart from the first entry every
+ * call, copy out only those at or after the caller's offset.
+ */
+STATIC int
+sysfs_class_readdir(struct vnop_readdir_args *ap)
+{
+    sfsnode_t  *dir_snp  = VTOSFS(ap->a_vp);
+    sfssnode_t *dir_snode = dir_snp->node_structure_node;
+    uio_t       uio      = ap->a_uio;
+    off_t       startpos = uio_offset(uio);
+    off_t       nextpos  = 0;
+    int         numentries = 0;
+    int         error    = 0;
+
+    uint32_t    class_id    = dir_snode->ssn_instance;
+    sfsbaseid_t base        = dir_snode->ssn_base_node_id;
+    uint64_t    self_fileid = sysfs_get_node_fileid(dir_snp);
+    boolean_t   exhausted   = FALSE;
+
+    const char *dots[2] = { ".", ".." };
+    for (int d = 0; d < 2; d++) {
+        int size = sysfs_calc_dirent_size(dots[d]);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_DIR, self_fileid, dots[d], uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                goto done;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+    for (unsigned int i = 0; error == 0 && uio_resid(uio) > 0; i++) {
+        char     devname[NAME_MAX + 1];
+        uint64_t dev_regid = 0;
+        if (!sysfs_iokit_class_child_at(class_id, i, devname, sizeof(devname), &dev_regid)) {
+            exhausted = TRUE;
+            break;
+        }
+        int size = sysfs_calc_dirent_size(devname);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_LNK,
+                        sysfs_get_fileid(dev_regid, SYSFS_NO_OBJECTID, base),
+                        devname, uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                break;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+done:
+    uio_setoffset(uio, nextpos);
+    *ap->a_eofflag   = (error == 0 && exhausted) ? 1 : 0;
+    *ap->a_numdirent = numentries;
+
+    /*
+     * Nothing emitted and not at end-of-directory means the caller's buffer was
+     * too small for even one entry; see the note in sysfs_vnop_readdir.
+     */
+    if (error == 0 && numentries == 0 && *ap->a_eofflag == 0) {
+        error = EINVAL;
+    }
+
+    return error;
+}
+
+/*
  * Calculates the packed size for a directory entry for a given file name. The
  * size is the sum of the fixed part of the dirent structure plus the space
  * required for the null-terminated name, rounded up to a multiple of 8 bytes
@@ -832,11 +949,19 @@ sysfs_vnop_getattr(struct vnop_getattr_args *ap)
         vtype = isdir ? VDIR : VREG;
         mode  = isdir ? READ_EXECUTE_ALL : READ_ALL;
         size  = isdir ? 0 : sysfs_device_attr_size(sysfs_node);
+    } else if (node_type == SFSlink) {
+        /*
+         * Report the true target length. A symlink whose st_size is 0 leads
+         * callers that size a readlink() buffer from it to allocate nothing.
+         */
+        char target[SYSFS_LINK_TARGET_MAX];
+        int tlen = sysfs_link_target(sysfs_node, target, sizeof(target));
+        vtype = VLNK;
+        mode  = ALL_ACCESS_ALL;                 /* target decides real access */
+        size  = (tlen > 0) ? (size_t)tlen : 0;
     } else {
         vtype = sysfs_allocvp(node_type);
-        if (node_type == SFSlink) {
-            mode = ALL_ACCESS_ALL;              /* target decides real access */
-        } else if (sysfs_is_directory_type(node_type)) {
+        if (sysfs_is_directory_type(node_type)) {
             mode = READ_EXECUTE_ALL;            /* 0555 */
         } else {
             mode = READ_ALL;                    /* 0444 */
@@ -870,6 +995,42 @@ sysfs_vnop_getattr(struct vnop_getattr_args *ap)
 }
 
 /*
+ * Render a class symlink's target: the device's path under /sys/devices, reached
+ * by climbing out of the class directory first. Returns the length written, or 0
+ * if the device is unknown or the target does not fit.
+ *
+ * The number of "../" segments is the link's own depth below /sys, counted from
+ * the structure tree rather than hard-coded, so a link placed at a different
+ * depth (/sys/block/<dev> versus /sys/class/net/<dev>) resolves correctly with
+ * no special-casing.
+ */
+STATIC int
+sysfs_link_target(sfsnode_t *snp, char *buf, size_t buflen)
+{
+    char path[SYSFS_LINK_TARGET_MAX];
+    size_t plen = sysfs_iokit_path(snp->node_id.nodeid_regid, path, sizeof(path));
+    if (plen == 0) {
+        return 0;
+    }
+
+    unsigned int depth = 0;
+    for (sfssnode_t *p = snp->node_structure_node->ssn_parent;
+         p != NULL && p->ssn_node_type != SFSroot; p = p->ssn_parent) {
+        depth++;
+    }
+
+    int off = 0;
+    for (unsigned int i = 0; i < depth && off < (int)buflen; i++) {
+        off += snprintf(buf + off, buflen - (size_t)off, "../");
+    }
+    off += snprintf(buf + off, buflen - (size_t)off, "devices/%s", path);
+    if (off <= 0 || off >= (int)buflen) {
+        return 0;
+    }
+    return off;
+}
+
+/*
  * Reads the content of a symbolic link. No symlinks exist in the scaffold tree
  * (the class/bus/block/dev views arrive with the IORegistry passes), so this
  * currently rejects every node; it is retained so the readlink op is present and
@@ -884,9 +1045,21 @@ sysfs_vnop_readlink(struct vnop_readlink_args *ap)
 
     if (snode->ssn_node_type == SFSlink) {
         /*
-         * No symlink targets are defined yet.
+         * A /sys/class (or /sys/block) entry: a symlink to the device's real
+         * home under /sys/devices, exactly as on Linux. The node id carries the
+         * registry entry, and the target is that entry's path below the devices
+         * root, reached by climbing out of the class directory first.
+         *
+         * The number of "../" segments is the link's own depth below /sys, which
+         * we count from the structure tree rather than hard-coding, so a link
+         * added at a different depth resolves correctly without special-casing.
          */
-        return ENOENT;
+        char target[SYSFS_LINK_TARGET_MAX];
+        int off = sysfs_link_target(snp, target, sizeof(target));
+        if (off <= 0) {
+            return ENOENT;      /* the device is gone, or its path did not fit */
+        }
+        return uiomove(target, off, ap->a_uio);
     }
     return EINVAL;
 }

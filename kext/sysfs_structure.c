@@ -29,6 +29,7 @@
 #include <sys/vnode.h>
 
 #include <fs/sysfs/sysfs.h>
+#include <fs/sysfs/sysfs_iokit.h>
 
 #pragma mark -
 #pragma mark Function Prototypes
@@ -122,7 +123,35 @@ sysfs_structure_init(void)
          */
         (void)add_directory(root_node, "block",      SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "bus",        SFSdir, next_node_id++, 0, 0, NULL, NULL);
-        (void)add_directory(root_node, "class",      SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        /*
+         * /sys/class/<class>/<device> - devices grouped by class, each entry a
+         * symlink into /sys/devices, as on Linux. Every class directory is
+         * marked dynamic and carries its class in ssn_instance; its single
+         * SFSlink child is the shared marker the members are presented through
+         * (the device itself is identified per-vnode by its registry id).
+         */
+        sfssnode_t *class_dir = add_directory(root_node, "class",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        static const struct {
+            const char *name;
+            uint32_t    id;
+        } sysfs_classes[] = {
+            { "net",          SYSFS_CLASS_NET   },
+            { "block",        SYSFS_CLASS_BLOCK },
+            { "tty",          SYSFS_CLASS_TTY   },
+            { "power_supply", SYSFS_CLASS_POWER },
+        };
+        for (size_t ci = 0; ci < sizeof(sysfs_classes) / sizeof(sysfs_classes[0]); ci++) {
+            sfssnode_t *cd = add_directory(class_dir, sysfs_classes[ci].name,
+                            SFSdir, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+            cd->ssn_instance = sysfs_classes[ci].id;
+            /*
+             * The marker every member of this class is presented through. It is
+             * never listed itself - the class readdir emits members instead.
+             */
+            (void)add_node(cd, "__member__", SFSlink, next_node_id++,
+                            SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+        }
 
         /*
          * dev/ holds the char/ and block/ major:minor symlink views.
