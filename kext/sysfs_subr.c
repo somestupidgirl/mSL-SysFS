@@ -31,9 +31,16 @@ sysfs_allocvp(sfstype sfs_type)
     case SFSsubsystem:
         return VDIR;
 
-    case SFSfile:           /* FALLTHROUGH */
-    case SFSattr:           /* FALLTHROUGH */
     case SFSmodule:
+        /*
+         * /sys/module/<name> is a directory, as on Linux. Its attribute files
+         * share this node type and are distinguished by nodeid_objectid, which
+         * sysfs_create_vnode() resolves to VREG.
+         */
+        return VDIR;
+
+    case SFSfile:           /* FALLTHROUGH */
+    case SFSattr:
         return VREG;
 
     case SFSlink:

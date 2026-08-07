@@ -305,7 +305,18 @@ sysfs_structure_init(void)
         (void)add_directory(root_node, "hypervisor", SFSdir, next_node_id++, 0, 0, NULL, NULL);
         sfssnode_t *kernel_dir =
             add_directory(root_node, "kernel",     SFSdir, next_node_id++, 0, 0, NULL, NULL);
-        (void)add_directory(root_node, "module",     SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        /*
+         * /sys/module/<name>/ - one directory per loaded kernel extension, with
+         * the attribute files Linux exposes (refcnt, coresize, initstate,
+         * version). The directory is dynamic and its single SFSmodule child is
+         * the shared marker every module is presented through; which module a
+         * node is stands in its load tag, exactly as a registry id identifies a
+         * /sys/devices node.
+         */
+        sfssnode_t *module_dir = add_directory(root_node, "module",
+                        SFSdir, next_node_id++, SSN_FLAG_MODULES, 0, NULL, NULL);
+        (void)add_node(module_dir, "__member__", SFSmodule, next_node_id++,
+                        SSN_FLAG_MODULES, 0, NULL, NULL);
         (void)add_directory(root_node, "power",      SFSdir, next_node_id++, 0, 0, NULL, NULL);
 
         /*

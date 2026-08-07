@@ -178,6 +178,14 @@ typedef int (*sysfs_read_data_fn)(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 #define SSN_FLAG_WHOLE_ONLY (1 << 1)
 
 /*
+ * The directory expands to the list of loaded kernel extensions (/sys/module).
+ * Like SSN_FLAG_DYNAMIC this marks the directory itself; its single SFSmodule
+ * child is the shared node every module is presented through, distinguished
+ * per-vnode by the module's load tag.
+ */
+#define SSN_FLAG_MODULES    (1 << 2)
+
+/*
  * Special values for the nodeid_regid and nodeid_objectid fields.
  */
 #define SYSFS_NO_REGID      ((uint64_t)0)   /* node not backed by an IORegistry entry */

@@ -30,6 +30,30 @@
 #include <libkern/c++/OSIterator.h>
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSString.h>
+#include <libkern/c++/OSSymbol.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSCollectionIterator.h>
+
+/*
+ * OSKext::copyLoadedKextInfo() is declared here rather than by including
+ * <libkern/c++/OSKext.h>, which is unusable from a kext build: it pulls in
+ * <libkern/OSKextLibPrivate.h>, a private header the SDK does not ship. A
+ * one-method declaration is enough - a static member call mangles from the
+ * class name and parameter types alone, so this emits exactly the same symbol
+ * reference the real header would, without vendoring private headers.
+ *
+ * The return type is spelled OSDictionary* because OSPtr<T> is a plain T* in
+ * kext builds, and the return type takes no part in C++ mangling regardless.
+ *
+ * Caller owns a reference to the returned dictionary.
+ */
+class OSKext {
+public:
+    static OSDictionary *copyLoadedKextInfo(OSArray *kextIdentifiers,
+                                            OSArray *keys);
+};
 #include <libkern/libkern.h>
 
 #include <string.h>
@@ -47,6 +71,12 @@ extern "C" {
 #define SYSFS_IOKIT_BSDNAMEMAX 32
 /* Sanity cap on service-plane entries in one snapshot. */
 #define SYSFS_IOKIT_MAXNODES  16384u
+
+/*
+ * Upper bound on loaded kexts recorded for /sys/module. A running system has a
+ * few hundred; the cap only stops a pathological case from unbounded growth.
+ */
+#define SYSFS_IOKIT_MAXMODULES 1024u
 /* How long a snapshot is reused before a rebuild (ns). */
 #define SYSFS_SNAP_TTL_NS     2000000000ULL   /* 2 seconds */
 
@@ -105,7 +135,30 @@ struct sysfs_hash_slot {
 };
 
 /* Container holding a full self-contained IOKit registry snapshot */
+/*
+ * One loaded kernel extension, as presented under /sys/module/<name>.
+ *
+ * Captured on the refresh thread with the rest of the snapshot, never in a
+ * vnop: OSKext::copyLoadedKextInfo() takes the kext lock and builds a
+ * dictionary describing every loaded kext, which is far too heavy - and too
+ * lock-entangled - to do while holding VFS locks.
+ *
+ * load_tag is the kext's OSBundleLoadTag: unique among loaded kexts and stable
+ * for as long as the kext stays loaded, which makes it the natural per-node key
+ * (the same role IORegistryEntryID plays for /sys/devices).
+ */
+struct sysfs_snap_module {
+    uint64_t load_tag;
+    uint64_t load_size;                 /* OSBundleLoadSize, bytes */
+    uint64_t refcnt;                    /* OSBundleRetainCount */
+    char     name[128];                 /* CFBundleIdentifier */
+    char     version[32];               /* CFBundleVersion */
+};
+
 struct sysfs_snapshot {
+    struct sysfs_snap_module *modules;
+    uint32_t                  module_count;
+    uint32_t                  module_cap;
     struct sysfs_snap_node *nodes;
     uint32_t               *child_idx;
     struct sysfs_hash_slot *hash;
@@ -217,6 +270,10 @@ sysfs_snap_free(struct sysfs_snapshot *snap)
     if (snap == nullptr) {
         return;
     }
+    if (snap->modules != nullptr) {
+        sysfs_free(snap->modules,
+                   (size_t)snap->module_cap * sizeof(*snap->modules));
+    }
     if (snap->nodes != nullptr) {
         sysfs_free(snap->nodes, (size_t)snap->node_cap * sizeof(*snap->nodes));
     }
@@ -299,6 +356,109 @@ sysfs_count_entries(void)
     return n;
 }
 
+
+
+/*
+ * Capture the loaded kext list into the snapshot, for /sys/module.
+ *
+ * copyLoadedKextInfo() is asked for only the four keys we publish rather than
+ * the full per-kext dictionary, which keeps the work (and the time the kext
+ * lock is held) proportional to what we actually use. A kext missing any of
+ * them is still listed - the value simply reads as zero or empty - because a
+ * present-but-incomplete module is more useful than a hidden one.
+ *
+ * Failure here is never fatal: the snapshot is published regardless and
+ * /sys/module reads as empty, exactly as it does before the first refresh.
+ */
+static void
+sysfs_snap_build_modules(struct sysfs_snapshot *snap)
+{
+    static const char * const wanted[] = {
+        "OSBundleLoadTag",
+        "OSBundleLoadSize",
+        "OSBundleRetainCount",
+        "CFBundleVersion",
+    };
+
+    OSArray *keys = OSArray::withCapacity(4);
+    if (keys == nullptr) {
+        return;
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        const OSSymbol *sym = OSSymbol::withCString(wanted[i]);
+        if (sym != nullptr) {
+            keys->setObject(const_cast<OSSymbol *>(sym));
+            sym->release();
+        }
+    }
+
+    OSDictionary *info = OSKext::copyLoadedKextInfo(nullptr, keys);
+    keys->release();
+    if (info == nullptr) {
+        return;
+    }
+
+    uint32_t cap = info->getCount();
+    if (cap == 0) {
+        info->release();
+        return;
+    }
+    if (cap > SYSFS_IOKIT_MAXMODULES) {
+        cap = SYSFS_IOKIT_MAXMODULES;
+    }
+
+    size_t bytes = (size_t)cap * sizeof(struct sysfs_snap_module);
+    struct sysfs_snap_module *arr =
+        (struct sysfs_snap_module *)sysfs_alloc(bytes);
+    if (arr == nullptr) {
+        info->release();
+        return;
+    }
+
+    OSCollectionIterator *it = OSCollectionIterator::withCollection(info);
+    if (it == nullptr) {
+        sysfs_free(arr, bytes);
+        info->release();
+        return;
+    }
+
+    uint32_t n = 0;
+    OSObject *k;
+    while ((k = it->getNextObject()) != nullptr && n < cap) {
+        OSString *ident = OSDynamicCast(OSString, k);
+        if (ident == nullptr) {
+            continue;
+        }
+        OSDictionary *kd = OSDynamicCast(OSDictionary, info->getObject(ident));
+        if (kd == nullptr) {
+            continue;
+        }
+
+        struct sysfs_snap_module *m = &arr[n];
+        strlcpy(m->name, ident->getCStringNoCopy(), sizeof(m->name));
+
+        OSNumber *num = OSDynamicCast(OSNumber, kd->getObject("OSBundleLoadTag"));
+        m->load_tag = (num != nullptr) ? num->unsigned64BitValue() : 0;
+        num = OSDynamicCast(OSNumber, kd->getObject("OSBundleLoadSize"));
+        m->load_size = (num != nullptr) ? num->unsigned64BitValue() : 0;
+        num = OSDynamicCast(OSNumber, kd->getObject("OSBundleRetainCount"));
+        m->refcnt = (num != nullptr) ? num->unsigned64BitValue() : 0;
+
+        OSString *ver = OSDynamicCast(OSString, kd->getObject("CFBundleVersion"));
+        if (ver != nullptr) {
+            strlcpy(m->version, ver->getCStringNoCopy(), sizeof(m->version));
+        }
+        n++;
+    }
+    it->release();
+    info->release();
+
+    snap->modules      = arr;
+    snap->module_cap   = cap;
+    snap->module_count = n;
+    snap->bytes       += bytes;
+    OSAddAtomic64((int64_t)bytes, &sysfs_stat_snap_bytes);
+}
 
 /* Builds a fresh snapshot completely in isolation without holding global locks. */
 static struct sysfs_snapshot *
@@ -533,6 +693,8 @@ sysfs_snap_build(void)
             snap->nodes[ci].dup_ordinal = dup;
         }
     }
+
+    sysfs_snap_build_modules(snap);
 
     clock_get_uptime(&snap->uptime);
     return snap;
@@ -983,4 +1145,84 @@ sysfs_iokit_name(uint64_t regid, char *buf, size_t buflen)
     }
     IOLockUnlock(g_lock);
     return n;
+}
+
+#pragma mark - loaded kernel extensions (/sys/module)
+
+/*
+ * Copy one snapshot module record out to the caller. Must hold g_lock.
+ */
+static void
+sysfs_module_copy_out(const struct sysfs_snap_module *m,
+                      struct sysfs_module_info *out)
+{
+    out->load_tag  = m->load_tag;
+    out->load_size = m->load_size;
+    out->refcnt    = m->refcnt;
+    strlcpy(out->name, m->name, sizeof(out->name));
+    strlcpy(out->version, m->version, sizeof(out->version));
+}
+
+extern "C" int
+sysfs_iokit_module_at(unsigned int index, struct sysfs_module_info *out)
+{
+    if (out == nullptr || g_lock == nullptr) {
+        return 0;
+    }
+    sysfs_snap_ensure();
+    IOLockLock(g_lock);
+    int ok = 0;
+    if (g_snapshot != nullptr && g_snapshot->modules != nullptr &&
+        index < g_snapshot->module_count) {
+        sysfs_module_copy_out(&g_snapshot->modules[index], out);
+        ok = 1;
+    }
+    IOLockUnlock(g_lock);
+    return ok;
+}
+
+extern "C" int
+sysfs_iokit_module_named(const char *name, size_t namelen,
+                         struct sysfs_module_info *out)
+{
+    if (name == nullptr || out == nullptr || g_lock == nullptr) {
+        return 0;
+    }
+    sysfs_snap_ensure();
+    IOLockLock(g_lock);
+    int ok = 0;
+    if (g_snapshot != nullptr && g_snapshot->modules != nullptr) {
+        for (uint32_t i = 0; i < g_snapshot->module_count; i++) {
+            const char *nm = g_snapshot->modules[i].name;
+            if (strlen(nm) == namelen && strncmp(nm, name, namelen) == 0) {
+                sysfs_module_copy_out(&g_snapshot->modules[i], out);
+                ok = 1;
+                break;
+            }
+        }
+    }
+    IOLockUnlock(g_lock);
+    return ok;
+}
+
+extern "C" int
+sysfs_iokit_module_by_tag(uint64_t load_tag, struct sysfs_module_info *out)
+{
+    if (out == nullptr || g_lock == nullptr) {
+        return 0;
+    }
+    sysfs_snap_ensure();
+    IOLockLock(g_lock);
+    int ok = 0;
+    if (g_snapshot != nullptr && g_snapshot->modules != nullptr) {
+        for (uint32_t i = 0; i < g_snapshot->module_count; i++) {
+            if (g_snapshot->modules[i].load_tag == load_tag) {
+                sysfs_module_copy_out(&g_snapshot->modules[i], out);
+                ok = 1;
+                break;
+            }
+        }
+    }
+    IOLockUnlock(g_lock);
+    return ok;
 }

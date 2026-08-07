@@ -79,6 +79,20 @@ static const int NAME_BUFFER_SIZE = MAX_STRUCT_NODE_NAME_LEN;
 #define SYSFS_DEV_DIR_OBJID   ((uint64_t)0)   /* the device directory */
 #define SYSFS_DEV_ATTR_NAME   ((uint64_t)1)   /* the "name" file */
 
+/*
+ * /sys/module dynamic nodes (SFSmodule).
+ *
+ * The same shape as SFSdevice above: one shared SFSmodule structure node backs
+ * every directory under /sys/module, the kext's load tag stands in
+ * nodeid_regid, and nodeid_objectid selects the module directory itself (0) or
+ * one of its attribute files.
+ */
+#define SYSFS_MOD_DIR_OBJID       ((uint64_t)0)   /* the module directory */
+#define SYSFS_MOD_ATTR_REFCNT     ((uint64_t)1)
+#define SYSFS_MOD_ATTR_CORESIZE   ((uint64_t)2)
+#define SYSFS_MOD_ATTR_INITSTATE  ((uint64_t)3)
+#define SYSFS_MOD_ATTR_VERSION    ((uint64_t)4)
+
 /* Upper bound on an attribute file's value (IOKit names are well under this). */
 #define SYSFS_ATTR_VALUE_MAX  256
 
@@ -114,6 +128,23 @@ sysfs_dev_is_dir(uint64_t objectid)
 }
 
 /*
+ * The /sys/module container itself. Its SFSmodule child carries the same flag
+ * (flags propagate to descendants), so the node type distinguishes them.
+ */
+static inline boolean_t
+sysfs_is_module_dir(const sfssnode_t *snode)
+{
+    return (snode->ssn_flags & SSN_FLAG_MODULES) != 0 &&
+           snode->ssn_node_type == SFSdir;
+}
+
+static inline boolean_t
+sysfs_mod_is_dir(uint64_t objectid)
+{
+    return objectid == SYSFS_MOD_DIR_OBJID;
+}
+
+/*
  * The attribute files every /sys/devices entry exposes. Slice 1 exposes just
  * "name" (the IOKit entry name); kept as a table so more IOKit properties slot
  * in without touching the readdir/lookup logic.
@@ -126,6 +157,24 @@ static const struct sysfs_dev_attr sysfs_dev_attrs[] = {
     { "name", SYSFS_DEV_ATTR_NAME },
 };
 #define SYSFS_DEV_NATTRS ((int)(sizeof(sysfs_dev_attrs) / sizeof(sysfs_dev_attrs[0])))
+
+/*
+ * The attribute files every /sys/module entry exposes, named as on Linux.
+ * "initstate" is always "live": a kext that appears in the loaded-kext list has
+ * finished starting, and the transient states Linux reports (coming, going)
+ * have no observable equivalent here.
+ */
+struct sysfs_mod_attr {
+    const char *name;
+    uint64_t    objid;
+};
+static const struct sysfs_mod_attr sysfs_mod_attrs[] = {
+    { "refcnt",    SYSFS_MOD_ATTR_REFCNT    },
+    { "coresize",  SYSFS_MOD_ATTR_CORESIZE  },
+    { "initstate", SYSFS_MOD_ATTR_INITSTATE },
+    { "version",   SYSFS_MOD_ATTR_VERSION   },
+};
+#define SYSFS_MOD_NATTRS ((int)(sizeof(sysfs_mod_attrs) / sizeof(sysfs_mod_attrs[0])))
 
 #pragma mark -
 #pragma mark Function Prototypes
@@ -151,6 +200,9 @@ STATIC int sysfs_devices_readdir(struct vnop_readdir_args *ap);
 STATIC int sysfs_class_readdir(struct vnop_readdir_args *ap);
 STATIC int sysfs_device_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio);
 STATIC size_t sysfs_device_attr_size(sfsnode_t *snp);
+STATIC int sysfs_module_readdir(struct vnop_readdir_args *ap);
+STATIC int sysfs_module_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio);
+STATIC size_t sysfs_module_attr_size(sfsnode_t *snp);
 STATIC int sysfs_link_target(sfsnode_t *snp, char *buf, size_t buflen);
 
 #pragma mark -
@@ -380,7 +432,21 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
         sfssnode_t *dir_snode = dir_snp->node_structure_node;
         sfssnode_t *parent_snode;
 
-        if (dir_snode->ssn_node_type == SFSdevice &&
+        if (dir_snode->ssn_node_type == SFSmodule &&
+            sysfs_mod_is_dir(dir_snp->node_id.nodeid_objectid)) {
+            /*
+             * /sys/module/<name>/.. is the /sys/module container: the static
+             * parent, but with the load tag cleared - it identifies this module,
+             * not the directory holding every module.
+             */
+            parent_snode = dir_snode->ssn_parent;
+            if (parent_snode == NULL) {
+                parent_snode = dir_snode;
+            }
+            parent_node_id.nodeid_base_id  = parent_snode->ssn_base_node_id;
+            parent_node_id.nodeid_regid    = SYSFS_NO_REGID;
+            parent_node_id.nodeid_objectid = SYSFS_NO_OBJECTID;
+        } else if (dir_snode->ssn_node_type == SFSdevice &&
             dir_snp->node_id.nodeid_regid != 0) {
             /*
              * A nested /sys/devices directory: its parent is the enclosing
@@ -433,7 +499,38 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
         sfssnode_t *match_node = NULL;
         sfsid_t match_node_id = { 0 };
 
-        if (sysfs_is_class_dir(dir_snode)) {
+        if (sysfs_is_module_dir(dir_snode)) {
+            /*
+             * /sys/module/<name>: the entries are whichever kexts are loaded.
+             * The matched entry reuses the shared SFSmodule child, keyed by the
+             * module's load tag.
+             */
+            struct sysfs_module_info mi;
+            if (sysfs_iokit_module_named(name, (size_t)cnp->cn_namelen, &mi)) {
+                sfssnode_t *mod = TAILQ_FIRST(&dir_snode->ssn_children);
+                while (mod != NULL && mod->ssn_node_type != SFSmodule) {
+                    mod = TAILQ_NEXT(mod, ssn_next);
+                }
+                if (mod != NULL) {
+                    match_node = mod;
+                    match_node_id.nodeid_base_id  = mod->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = mi.load_tag;
+                    match_node_id.nodeid_objectid = SYSFS_MOD_DIR_OBJID;
+                }
+            }
+        } else if (dir_snode->ssn_node_type == SFSmodule &&
+                   sysfs_mod_is_dir(dir_snp->node_id.nodeid_objectid)) {
+            /* Inside a module directory: match its attribute files. */
+            for (int a = 0; a < SYSFS_MOD_NATTRS; a++) {
+                if (strcmp(name, sysfs_mod_attrs[a].name) == 0) {
+                    match_node = dir_snode;
+                    match_node_id.nodeid_base_id  = dir_snode->ssn_base_node_id;
+                    match_node_id.nodeid_regid    = dir_snp->node_id.nodeid_regid;
+                    match_node_id.nodeid_objectid = sysfs_mod_attrs[a].objid;
+                    break;
+                }
+            }
+        } else if (sysfs_is_class_dir(dir_snode)) {
             /*
              * A class directory's entries are not structure children - they are
              * whichever devices currently belong to the class. The matched entry
@@ -587,6 +684,10 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
     /*
      * Class directories enumerate their members, not static children.
      */
+    if (sysfs_is_module_dir(dir_snode) || dir_snode->ssn_node_type == SFSmodule) {
+        return sysfs_module_readdir(ap);
+    }
+
     if (sysfs_is_class_dir(dir_snode)) {
         return sysfs_class_readdir(ap);
     }
@@ -617,9 +718,12 @@ sysfs_vnop_readdir(struct vnop_readdir_args *ap)
             type = DT_DIR;
             break;
 
-        case SFSfile:           /* FALLTHROUGH */
-        case SFSattr:           /* FALLTHROUGH */
         case SFSmodule:
+            type = DT_DIR;
+            break;
+
+        case SFSfile:           /* FALLTHROUGH */
+        case SFSattr:
             type = DT_REG;
             break;
 
@@ -965,6 +1069,12 @@ sysfs_vnop_getattr(struct vnop_getattr_args *ap)
         vtype = isdir ? VDIR : VREG;
         mode  = isdir ? READ_EXECUTE_ALL : READ_ALL;
         size  = isdir ? 0 : sysfs_device_attr_size(sysfs_node);
+    } else if (node_type == SFSmodule) {
+        /* Same split as SFSdevice: module directory, or one of its attributes. */
+        boolean_t isdir = sysfs_mod_is_dir(sysfs_node->node_id.nodeid_objectid);
+        vtype = isdir ? VDIR : VREG;
+        mode  = isdir ? READ_EXECUTE_ALL : READ_ALL;
+        size  = isdir ? 0 : sysfs_module_attr_size(sysfs_node);
     } else if (node_type == SFSlink) {
         /*
          * Report the true target length. A symlink whose st_size is 0 leads
@@ -1109,6 +1219,15 @@ sysfs_vnop_read(struct vnop_read_args *ap)
         return sysfs_device_read_attr(snp, objid, ap->a_uio);
     }
 
+    /* Likewise for /sys/module nodes. */
+    if (snode->ssn_node_type == SFSmodule) {
+        uint64_t objid = snp->node_id.nodeid_objectid;
+        if (sysfs_mod_is_dir(objid)) {
+            return EISDIR;
+        }
+        return sysfs_module_read_attr(snp, objid, ap->a_uio);
+    }
+
     int error = EINVAL;
     if (sysfs_is_directory_type(snode->ssn_node_type)) {
         error = EISDIR;
@@ -1203,6 +1322,176 @@ sysfs_vnop_reclaim(struct vnop_reclaim_args *ap)
 #pragma mark -
 #pragma mark Helper Functions
 
+
+/*
+ * Readdir for /sys/module and for a single module's directory.
+ *
+ * Both live on the same shared SFSmodule node, so one function serves both: the
+ * container (SFSdir, SSN_FLAG_MODULES) lists one subdirectory per loaded kext,
+ * and a module directory lists that module's attribute files. Offset/EOF
+ * accounting matches the other readdirs - start from the first entry every
+ * call, copy only entries at or after the caller's offset - so a directory too
+ * large for one buffer resumes correctly.
+ */
+STATIC int
+sysfs_module_readdir(struct vnop_readdir_args *ap)
+{
+    sfsnode_t  *dir_snp  = VTOSFS(ap->a_vp);
+    uio_t       uio      = ap->a_uio;
+    off_t       startpos = uio_offset(uio);
+    off_t       nextpos  = 0;
+    int         numentries = 0;
+    int         error    = 0;
+
+    sfssnode_t *dir_snode   = dir_snp->node_structure_node;
+    sfsbaseid_t base        = dir_snode->ssn_base_node_id;
+    uint64_t    self_fileid = sysfs_get_node_fileid(dir_snp);
+    boolean_t   is_container = sysfs_is_module_dir(dir_snode);
+    boolean_t   exhausted   = FALSE;
+
+    /* "." and ".." */
+    const char *dots[2] = { ".", ".." };
+    for (int d = 0; d < 2; d++) {
+        int size = sysfs_calc_dirent_size(dots[d]);
+        if (nextpos >= startpos) {
+            error = sysfs_copyout_dirent(DT_DIR, self_fileid, dots[d], uio, &size, nextpos + size);
+            if (size == 0 || error != 0) {
+                goto done;
+            }
+            numentries++;
+        }
+        nextpos += size;
+    }
+
+    if (is_container) {
+        /*
+         * One subdirectory per loaded kext. The shared SFSmodule child supplies
+         * the base id; the load tag distinguishes the entries.
+         */
+        sfssnode_t *mod = TAILQ_FIRST(&dir_snode->ssn_children);
+        while (mod != NULL && mod->ssn_node_type != SFSmodule) {
+            mod = TAILQ_NEXT(mod, ssn_next);
+        }
+        if (mod == NULL) {
+            exhausted = TRUE;
+            goto done;
+        }
+        for (unsigned int i = 0; error == 0 && uio_resid(uio) > 0; i++) {
+            struct sysfs_module_info mi;
+            if (!sysfs_iokit_module_at(i, &mi)) {
+                exhausted = TRUE;
+                break;
+            }
+            int size = sysfs_calc_dirent_size(mi.name);
+            if (nextpos >= startpos) {
+                error = sysfs_copyout_dirent(DT_DIR,
+                            sysfs_get_fileid(mi.load_tag, SYSFS_MOD_DIR_OBJID,
+                                             mod->ssn_base_node_id),
+                            mi.name, uio, &size, nextpos + size);
+                if (size == 0 || error != 0) {
+                    break;
+                }
+                numentries++;
+            }
+            nextpos += size;
+        }
+    } else {
+        /* A module directory: its attribute files. */
+        uint64_t load_tag = dir_snp->node_id.nodeid_regid;
+        int a = 0;
+        for (; error == 0 && a < SYSFS_MOD_NATTRS && uio_resid(uio) > 0; a++) {
+            const char *nm = sysfs_mod_attrs[a].name;
+            int size = sysfs_calc_dirent_size(nm);
+            if (nextpos >= startpos) {
+                error = sysfs_copyout_dirent(DT_REG,
+                            sysfs_get_fileid(load_tag, sysfs_mod_attrs[a].objid, base),
+                            nm, uio, &size, nextpos + size);
+                if (size == 0 || error != 0) {
+                    break;
+                }
+                numentries++;
+            }
+            nextpos += size;
+        }
+        if (error == 0 && a >= SYSFS_MOD_NATTRS) {
+            exhausted = TRUE;
+        }
+    }
+
+done:
+    uio_setoffset(uio, nextpos);
+    *ap->a_eofflag   = (error == 0 && exhausted) ? 1 : 0;
+    *ap->a_numdirent = numentries;
+
+    if (error == 0 && numentries == 0 && *ap->a_eofflag == 0) {
+        error = EINVAL;
+    }
+
+    return error;
+}
+
+/*
+ * Render one /sys/module attribute file. Values are formatted as Linux formats
+ * them: plain decimal for the counters, a bare string for the rest, each with a
+ * trailing newline.
+ */
+STATIC int
+sysfs_module_format_attr(sfsnode_t *snp, uint64_t objid, char *buf, size_t buflen)
+{
+    struct sysfs_module_info mi;
+
+    if (!sysfs_iokit_module_by_tag(snp->node_id.nodeid_regid, &mi)) {
+        /* The kext unloaded since the vnode was created. */
+        buf[0] = '\0';
+        return 0;
+    }
+
+    switch (objid) {
+    case SYSFS_MOD_ATTR_REFCNT:
+        return snprintf(buf, buflen, "%llu\n", mi.refcnt);
+    case SYSFS_MOD_ATTR_CORESIZE:
+        return snprintf(buf, buflen, "%llu\n", mi.load_size);
+    case SYSFS_MOD_ATTR_INITSTATE:
+        return snprintf(buf, buflen, "live\n");
+    case SYSFS_MOD_ATTR_VERSION:
+        return snprintf(buf, buflen, "%s\n", mi.version);
+    default:
+        buf[0] = '\0';
+        return 0;
+    }
+}
+
+STATIC int
+sysfs_module_read_attr(sfsnode_t *snp, uint64_t objid, uio_t uio)
+{
+    char buf[SYSFS_ATTR_VALUE_MAX];
+    int n = sysfs_module_format_attr(snp, objid, buf, sizeof(buf));
+
+    if (n <= 0) {
+        return (objid > SYSFS_MOD_ATTR_VERSION) ? EINVAL : 0;
+    }
+    if (n > (int)sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;   /* snprintf reports the untruncated length */
+    }
+    return sysfs_copy_data(buf, n, uio);
+}
+
+/*
+ * Byte count sysfs_module_read_attr would produce, for getattr's va_data_size.
+ */
+STATIC size_t
+sysfs_module_attr_size(sfsnode_t *snp)
+{
+    char buf[SYSFS_ATTR_VALUE_MAX];
+    int n = sysfs_module_format_attr(snp, snp->node_id.nodeid_objectid,
+                                     buf, sizeof(buf));
+
+    if (n <= 0) {
+        return 0;
+    }
+    return (n > (int)sizeof(buf) - 1) ? sizeof(buf) - 1 : (size_t)n;
+}
+
 /*
  * Creates a vnode with given properties, which depend on the vnode type.
  */
@@ -1224,8 +1513,11 @@ sysfs_create_vnode(sysfs_vnode_create_args *cap, sfsnode_t *snp, vnode_t *vpp)
      * /sys/devices nodes are directories or attribute files depending on the
      * objectid carried in the node id, not on the structure type alone.
      */
-    vnode_create_params.vnfs_vtype = (snode->ssn_node_type == SFSdevice)
-        ? (sysfs_dev_is_dir(snp->node_id.nodeid_objectid) ? VDIR : VREG)
+    vnode_create_params.vnfs_vtype =
+        (snode->ssn_node_type == SFSdevice)
+            ? (sysfs_dev_is_dir(snp->node_id.nodeid_objectid) ? VDIR : VREG)
+        : (snode->ssn_node_type == SFSmodule)
+            ? (sysfs_mod_is_dir(snp->node_id.nodeid_objectid) ? VDIR : VREG)
         : sysfs_allocvp(snode->ssn_node_type);
     vnode_create_params.vnfs_str = "sysfs vnode";
     vnode_create_params.vnfs_dvp = cap->vca_parentvp;

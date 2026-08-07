@@ -125,6 +125,41 @@ int sysfs_iokit_class_child_named(uint32_t class_id, uint32_t match_flags,
  */
 size_t sysfs_iokit_path(uint64_t regid, char *buf, size_t buflen);
 
+/*
+ * Loaded kernel extensions, for /sys/module.
+ *
+ * The kext list is captured with the registry snapshot on the refresh thread,
+ * never in a vnop: OSKext::copyLoadedKextInfo() takes the kext lock and builds
+ * a dictionary describing every loaded kext, far too heavy - and too
+ * lock-entangled - to do while holding VFS locks. These accessors only read the
+ * published snapshot.
+ *
+ * load_tag is the kext's OSBundleLoadTag: unique among loaded kexts and stable
+ * while the kext stays loaded, so it keys a /sys/module node the way
+ * IORegistryEntryID keys a /sys/devices node.
+ */
+struct sysfs_module_info {
+    uint64_t load_tag;
+    uint64_t load_size;       /* OSBundleLoadSize, bytes */
+    uint64_t refcnt;          /* OSBundleRetainCount */
+    char     name[128];       /* CFBundleIdentifier */
+    char     version[32];     /* CFBundleVersion */
+};
+
+/*
+ * Fill *out with the index-th loaded kext; returns 1 while modules remain, 0
+ * past the end. Enumeration order is whatever the kext list yields and is
+ * stable for the life of one snapshot.
+ */
+int sysfs_iokit_module_at(unsigned int index, struct sysfs_module_info *out);
+
+/* Resolve a module by bundle identifier. Returns 1 if found. */
+int sysfs_iokit_module_named(const char *name, size_t namelen,
+                             struct sysfs_module_info *out);
+
+/* Resolve a module by its load tag (the per-node key). Returns 1 if found. */
+int sysfs_iokit_module_by_tag(uint64_t load_tag, struct sysfs_module_info *out);
+
 #ifdef __cplusplus
 }
 #endif
