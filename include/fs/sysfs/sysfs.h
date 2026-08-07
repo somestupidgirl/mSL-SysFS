@@ -171,6 +171,13 @@ typedef int (*sysfs_read_data_fn)(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 #define SSN_FLAG_DYNAMIC    (1 << 0)
 
 /*
+ * A class directory that lists only whole block devices. This is what separates
+ * /sys/block (whole disks; a partition lives under its disk in /sys/devices)
+ * from /sys/class/block (every block device, flat), matching Linux.
+ */
+#define SSN_FLAG_WHOLE_ONLY (1 << 1)
+
+/*
  * Special values for the nodeid_regid and nodeid_objectid fields.
  */
 #define SYSFS_NO_REGID      ((uint64_t)0)   /* node not backed by an IORegistry entry */

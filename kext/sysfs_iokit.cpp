@@ -28,6 +28,8 @@
 
 #include <libkern/c++/OSObject.h>
 #include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
 
 #include <string.h>
@@ -91,6 +93,7 @@ struct sysfs_snap_node {
      * about the object - which a vnop must never do.
      */
     uint32_t class_id;
+    uint32_t class_flags;     /* SYSFS_CLASSF_* */
     char     bsdname[SYSFS_IOKIT_BSDNAMEMAX];
     char     name[SYSFS_IOKIT_NAMEMAX];   /* base IOKit name */
 };
@@ -393,6 +396,7 @@ sysfs_snap_build(void)
              * what Linux calls it and what the /sys/class entry is named.
              */
             nd->class_id = SYSFS_CLASS_NONE;
+            nd->class_flags = 0;
             nd->bsdname[0] = '\0';
             uint32_t cls = SYSFS_CLASS_NONE;
             if (e->metaCast("IOMedia") != nullptr) {
@@ -409,6 +413,13 @@ sysfs_snap_build(void)
                 if (bsd != nullptr) {
                     strlcpy(nd->bsdname, bsd->getCStringNoCopy(), sizeof(nd->bsdname));
                     nd->class_id = cls;
+                    if (cls == SYSFS_CLASS_BLOCK) {
+                        OSBoolean *whole =
+                            OSDynamicCast(OSBoolean, e->getProperty("Whole"));
+                        if (whole != nullptr && whole->isTrue()) {
+                            nd->class_flags |= SYSFS_CLASSF_WHOLE;
+                        }
+                    }
                 } else if (cls == SYSFS_CLASS_POWER) {
                     /* Power sources have no BSD name; use the IOKit name. */
                     strlcpy(nd->bsdname, nd->name, sizeof(nd->bsdname));
@@ -839,7 +850,8 @@ sysfs_iokit_parent(uint64_t regid, uint64_t *parent_regid)
 }
 
 extern "C" int
-sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
+sysfs_iokit_class_child_at(uint32_t class_id, uint32_t match_flags,
+                           unsigned int index,
                            char *namebuf, size_t buflen, uint64_t *regid)
 {
     if (namebuf == nullptr || regid == nullptr || buflen == 0 || g_lock == nullptr) {
@@ -858,7 +870,8 @@ sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
          */
         unsigned int seen = 0;
         for (uint32_t i = 1; i < g_snapshot->node_count; i++) {
-            if (g_snapshot->nodes[i].class_id != class_id) {
+            if (g_snapshot->nodes[i].class_id != class_id ||
+                (g_snapshot->nodes[i].class_flags & match_flags) != match_flags) {
                 continue;
             }
             if (seen == index) {
@@ -875,7 +888,8 @@ sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
 }
 
 extern "C" int
-sysfs_iokit_class_child_named(uint32_t class_id, const char *name,
+sysfs_iokit_class_child_named(uint32_t class_id, uint32_t match_flags,
+                              const char *name,
                               size_t namelen, uint64_t *regid)
 {
     if (name == nullptr || regid == nullptr || g_lock == nullptr) {
@@ -887,7 +901,8 @@ sysfs_iokit_class_child_named(uint32_t class_id, const char *name,
     if (g_snapshot != nullptr) {
         for (uint32_t i = 1; i < g_snapshot->node_count; i++) {
             const struct sysfs_snap_node *nd = &g_snapshot->nodes[i];
-            if (nd->class_id != class_id) {
+            if (nd->class_id != class_id ||
+                (nd->class_flags & match_flags) != match_flags) {
                 continue;
             }
             if (strlen(nd->bsdname) == namelen &&

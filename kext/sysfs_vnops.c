@@ -90,6 +90,15 @@ static const int NAME_BUFFER_SIZE = MAX_STRUCT_NODE_NAME_LEN;
  * (/sys/class/net, /sys/block, ...). The class is carried in ssn_instance; the
  * entries are symlinks into /sys/devices, resolved by vnop_readlink.
  */
+/*
+ * The member attributes a class directory requires (see SYSFS_CLASSF_*).
+ */
+static inline uint32_t
+sysfs_class_match_flags(const sfssnode_t *snode)
+{
+    return (snode->ssn_flags & SSN_FLAG_WHOLE_ONLY) ? SYSFS_CLASSF_WHOLE : 0u;
+}
+
 static inline boolean_t
 sysfs_is_class_dir(const sfssnode_t *snode)
 {
@@ -429,7 +438,9 @@ sysfs_vnop_lookup(struct vnop_lookup_args *ap)
              * registry id in the node id.
              */
             uint64_t dev_regid = 0;
-            if (sysfs_iokit_class_child_named(dir_snode->ssn_instance, name,
+            if (sysfs_iokit_class_child_named(dir_snode->ssn_instance,
+                                              sysfs_class_match_flags(dir_snode),
+                                              name,
                                               (size_t)cnp->cn_namelen, &dev_regid)) {
                 sfssnode_t *link = TAILQ_FIRST(&dir_snode->ssn_children);
                 while (link != NULL && link->ssn_node_type != SFSlink) {
@@ -821,6 +832,7 @@ sysfs_class_readdir(struct vnop_readdir_args *ap)
     int         error    = 0;
 
     uint32_t    class_id    = dir_snode->ssn_instance;
+    uint32_t    match_flags = sysfs_class_match_flags(dir_snode);
     sfsbaseid_t base        = dir_snode->ssn_base_node_id;
     uint64_t    self_fileid = sysfs_get_node_fileid(dir_snp);
     boolean_t   exhausted   = FALSE;
@@ -841,7 +853,8 @@ sysfs_class_readdir(struct vnop_readdir_args *ap)
     for (unsigned int i = 0; error == 0 && uio_resid(uio) > 0; i++) {
         char     devname[NAME_MAX + 1];
         uint64_t dev_regid = 0;
-        if (!sysfs_iokit_class_child_at(class_id, i, devname, sizeof(devname), &dev_regid)) {
+        if (!sysfs_iokit_class_child_at(class_id, match_flags, i,
+                                        devname, sizeof(devname), &dev_regid)) {
             exhausted = TRUE;
             break;
         }

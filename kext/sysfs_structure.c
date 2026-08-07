@@ -129,14 +129,14 @@ sysfs_structure_init(void)
          * symlink target picks that up automatically because the "../" prefix is
          * derived from the link's depth rather than hard-coded.
          *
-         * Difference from Linux worth knowing: there, /sys/block holds whole
-         * devices and a partition appears as a subdirectory of its disk, while
-         * /sys/class/block holds everything flat. Here both are the flat list -
-         * every IOMedia, disks and partitions alike - so a partition is present
-         * and addressable, just not nested under its parent disk.
+         * As on Linux this lists whole disks only (SSN_FLAG_WHOLE_ONLY); a
+         * partition is reached through its disk under /sys/devices, where IOKit
+         * already nests partition IOMedia beneath the whole-disk IOMedia.
+         * /sys/class/block keeps the flat list of every block device.
          */
         sfssnode_t *block_dir = add_directory(root_node, "block",
-                        SFSdir, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+                        SFSdir, next_node_id++,
+                        SSN_FLAG_DYNAMIC | SSN_FLAG_WHOLE_ONLY, 0, NULL, NULL);
         block_dir->ssn_instance = SYSFS_CLASS_BLOCK;
         (void)add_node(block_dir, "__member__", SFSlink, next_node_id++,
                         SSN_FLAG_DYNAMIC, 0, NULL, NULL);

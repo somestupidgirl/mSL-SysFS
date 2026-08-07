@@ -96,14 +96,25 @@ size_t sysfs_iokit_name(uint64_t regid, char *buf, size_t buflen);
 #define SYSFS_CLASS_COUNT  5
 
 /*
+ * Per-member attributes a class listing can filter on. SYSFS_CLASSF_WHOLE marks
+ * a block device that is a whole disk rather than a partition, which is what
+ * separates /sys/block (whole disks only, partitions nested under their disk in
+ * /sys/devices) from /sys/class/block (every block device, flat) - the same
+ * split Linux makes.
+ */
+#define SYSFS_CLASSF_WHOLE 0x1u
+
+/*
  * Enumerate the members of a class. sysfs_iokit_class_child_at fills namebuf
  * with the index-th member's device name and *regid with its entry id, and
  * returns 1 while members remain. sysfs_iokit_class_child_named resolves one by
  * name. Both read the published snapshot, so they never touch IOKit directly.
  */
-int sysfs_iokit_class_child_at(uint32_t class_id, unsigned int index,
+int sysfs_iokit_class_child_at(uint32_t class_id, uint32_t match_flags,
+                               unsigned int index,
                                char *namebuf, size_t buflen, uint64_t *regid);
-int sysfs_iokit_class_child_named(uint32_t class_id, const char *name,
+int sysfs_iokit_class_child_named(uint32_t class_id, uint32_t match_flags,
+                                  const char *name,
                                   size_t namelen, uint64_t *regid);
 
 /*
