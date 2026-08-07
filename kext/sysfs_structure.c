@@ -121,7 +121,25 @@ sysfs_structure_init(void)
          *   module/      loaded kernel modules (kexts)
          *   power/       system power-management state
          */
-        (void)add_directory(root_node, "block",      SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        /*
+         * /sys/block/<device> - the block devices, each a symlink into
+         * /sys/devices. Same machinery as /sys/class (below): the directory is
+         * dynamic and carries SYSFS_CLASS_BLOCK, and the members come from the
+         * snapshot. It sits one level shallower than /sys/class/block, and the
+         * symlink target picks that up automatically because the "../" prefix is
+         * derived from the link's depth rather than hard-coded.
+         *
+         * Difference from Linux worth knowing: there, /sys/block holds whole
+         * devices and a partition appears as a subdirectory of its disk, while
+         * /sys/class/block holds everything flat. Here both are the flat list -
+         * every IOMedia, disks and partitions alike - so a partition is present
+         * and addressable, just not nested under its parent disk.
+         */
+        sfssnode_t *block_dir = add_directory(root_node, "block",
+                        SFSdir, next_node_id++, SSN_FLAG_DYNAMIC, 0, NULL, NULL);
+        block_dir->ssn_instance = SYSFS_CLASS_BLOCK;
+        (void)add_node(block_dir, "__member__", SFSlink, next_node_id++,
+                        SSN_FLAG_DYNAMIC, 0, NULL, NULL);
         (void)add_directory(root_node, "bus",        SFSdir, next_node_id++, 0, 0, NULL, NULL);
         /*
          * /sys/class/<class>/<device> - devices grouped by class, each entry a
