@@ -77,6 +77,7 @@ STATIC int sysfs_mount(struct mount *mp, vnode_t devvp, user_addr_t data, vfs_co
 STATIC int sysfs_unmount(struct mount *mp, int mntflags, vfs_context_t context);
 STATIC int sysfs_root(struct mount *mp, struct vnode **vpp, vfs_context_t context);
 STATIC int sysfs_getattr(struct mount *mp, struct vfs_attr *fsap, vfs_context_t context);
+STATIC int sysfs_sync(struct mount *mp, int waitfor, vfs_context_t context);
 
 STATIC void populate_statfs_info(struct mount *mp, struct vfsstatfs *statfsp);
 STATIC void populate_vfs_attr(struct mount *mp, struct vfs_attr *fsap);
@@ -97,6 +98,7 @@ struct vfsops sysfs_vfsops = {
     .vfs_unmount        = sysfs_unmount,
     .vfs_root           = sysfs_root,
     .vfs_getattr        = sysfs_getattr,
+    .vfs_sync           = sysfs_sync,
     .vfs_init           = sysfs_init,
 };
 
@@ -426,6 +428,24 @@ populate_statfs_info(struct mount *mp, struct vfsstatfs *statfsp)
         snprintf(statfsp->f_mntfromname, sizeof(statfsp->f_mntfromname) - 1,
                  "%s%d", MOUNTED_DEVICE_NAME, mounted_instance_count);
     }
+}
+
+/*
+ * Flushes the file system's data to permanent storage. sysfs has no backing
+ * store and holds no dirty state - every node is synthesised on demand - so
+ * there is nothing to flush and this always succeeds.
+ *
+ * Registering it is not optional. VFS_SYNC is called by the sync(2) system call
+ * and, critically, by dounmount() before it will unmount a filesystem that is
+ * not MNT_RDONLY. This mount is deliberately not MNT_RDONLY (see sysfs_mount),
+ * so with no handler here the VFS layer substitutes a stub that returns ENOTSUP
+ * and "umount /sys" fails with "Operation not supported" unless -f is given.
+ */
+STATIC int
+sysfs_sync(__unused struct mount *mp, __unused int waitfor,
+           __unused vfs_context_t context)
+{
+    return 0;
 }
 
 /*
