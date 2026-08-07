@@ -116,6 +116,7 @@ STATIC int sysfs_vnop_open(struct vnop_open_args *ap);
 STATIC int sysfs_vnop_close(struct vnop_close_args *ap);
 STATIC int sysfs_vnop_access(struct vnop_access_args *ap);
 STATIC int sysfs_vnop_inactive(struct vnop_inactive_args *ap);
+STATIC int sysfs_vnop_pathconf(struct vnop_pathconf_args *ap);
 
 STATIC inline int sysfs_calc_dirent_size(const char *name);
 STATIC int sysfs_copyout_dirent(int type, uint64_t file_id, const char *name, uio_t uio, int *sizep, off_t seekoff);
@@ -154,6 +155,7 @@ struct vnodeopv_entry_desc sysfs_vnodeop_entries[] = {
     { .opve_op = &vnop_readdirattr_desc,        .opve_impl = (VOPFUNC) err_readdirattr },               /* readdirattr -> ENOTSUP, forces fallback to getdirentries64 */
     { .opve_op = &vnop_getattrlistbulk_desc,    .opve_impl = (VOPFUNC) sysfs_vnop_getattrlistbulk },    /* getattrlistbulk -> ENOTSUP, forces fallback to readdir+getattr */
     { .opve_op = &vnop_readlink_desc,           .opve_impl = (VOPFUNC) sysfs_vnop_readlink },           /* readlink */
+    { .opve_op = &vnop_pathconf_desc,           .opve_impl = (VOPFUNC) sysfs_vnop_pathconf },          /* pathconf */
     { .opve_op = &vnop_inactive_desc,           .opve_impl = (VOPFUNC) sysfs_vnop_inactive },           /* inactive */
     { .opve_op = &vnop_reclaim_desc,            .opve_impl = (VOPFUNC) sysfs_vnop_reclaim },            /* reclaim */
     { .opve_op = (struct vnodeop_desc*)NULL,    .opve_impl = (int (*)(void *))NULL }
@@ -210,9 +212,61 @@ sysfs_vnop_inactive(__unused struct vnop_inactive_args *ap)
     return 0;
 }
 
+/*
+ * Fallback for every vnode operation this filesystem does not implement.
+ *
+ * This MUST report failure. Returning 0 tells VFS "handled, successfully" for
+ * operations we never touched - so the caller reads back output parameters we
+ * never wrote. That is not theoretical: getxattr/listxattr appear to succeed
+ * with an uninitialised result length, pathconf yields an uninitialised limit,
+ * and pagein claims to have filled a page it never faulted in. Finder, the Dock
+ * and LaunchServices query exactly those on paths they enumerate, which makes
+ * the damage look like a system problem rather than a filesystem one: launches
+ * and pasteboard operations wedge, and processes that consumed a bogus value
+ * never recover.
+ *
+ * ENOTSUP is what VFS expects from an unsupported optional operation, and it
+ * handles it gracefully everywhere.
+ */
 STATIC int
 sysfs_vnop_default(__unused struct vnop_generic_args *arg)
 {
+    return ENOTSUP;
+}
+
+/*
+ * Path limits. Implemented explicitly because the default above now (correctly)
+ * fails, and because a caller that gets a garbage limit back can size a buffer
+ * or bound a loop from it.
+ */
+STATIC int
+sysfs_vnop_pathconf(struct vnop_pathconf_args *ap)
+{
+    switch (ap->a_name) {
+    case _PC_LINK_MAX:
+        *ap->a_retval = 1;              /* no hard links */
+        break;
+    case _PC_NAME_MAX:
+        *ap->a_retval = NAME_MAX;
+        break;
+    case _PC_PATH_MAX:
+        *ap->a_retval = PATH_MAX;
+        break;
+    case _PC_CHOWN_RESTRICTED:
+        *ap->a_retval = 200112;         /* _POSIX_CHOWN_RESTRICTED */
+        break;
+    case _PC_NO_TRUNC:
+        *ap->a_retval = 0;              /* long names are an error, not truncated */
+        break;
+    case _PC_CASE_SENSITIVE:
+        *ap->a_retval = 1;
+        break;
+    case _PC_CASE_PRESERVING:
+        *ap->a_retval = 1;
+        break;
+    default:
+        return EINVAL;
+    }
     return 0;
 }
 
