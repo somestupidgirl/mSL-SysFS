@@ -305,9 +305,19 @@ sysfs_root(struct mount *mp, vnode_t *vpp, __unused vfs_context_t context)
  * sysfs. Most of them are dummy values and none of them change once the
  * file system has been mounted.
  */
+/*
+ * Counts VFS_GETATTR (statfs) calls against this mount. These create no vnodes,
+ * so they are invisible to sysfs.live_nodes - yet statfs-on-every-mount is
+ * exactly what Finder, Disk Arbitration, Spotlight and the Dock do constantly.
+ * Without this counter a storm of them would look like the filesystem was
+ * completely idle. Exposed as sysfs.vfs_getattr.
+ */
+int64_t sysfs_stat_vfs_getattr = 0;
+
 STATIC int
 sysfs_getattr(struct mount *mp, struct vfs_attr *fsap, __unused vfs_context_t context)
 {
+    OSAddAtomic64(1, &sysfs_stat_vfs_getattr);
     populate_vfs_attr(mp, fsap);
     return 0;
 }

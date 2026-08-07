@@ -15,6 +15,7 @@
  * process/thread markers.
  */
 #include <libkern/libkern.h>
+#include <libkern/OSAtomic.h>
 
 #include <sys/dirent.h>
 #include <sys/errno.h>
@@ -133,6 +134,14 @@ STATIC size_t sysfs_device_attr_size(sfsnode_t *snp);
  * is registered and used when creating vnodes.
  */
 int (**sysfs_vnodeop_p)(void *);
+
+/*
+ * Counts every vnode operation this filesystem services. sysfs.live_nodes shows
+ * how many nodes exist, not how hard they are being worked - a caller that
+ * repeatedly stats or reads one already-cached path drives no new nodes at all.
+ * Exposed as sysfs.vnops.
+ */
+int64_t sysfs_stat_vnops = 0;
 
 /*
  * Entries for the vnode operations that this file system supports. This table is
@@ -295,6 +304,7 @@ sysfs_vnop_getattrlistbulk(__unused struct vnop_getattrlistbulk_args *ap)
 STATIC int
 sysfs_vnop_lookup(struct vnop_lookup_args *ap)
 {
+    OSAddAtomic64(1, &sysfs_stat_vnops);
     char name[NAME_MAX + 1];
     int error = 0;
     struct componentname *cnp = ap->a_cnp;
@@ -504,6 +514,7 @@ out:
 STATIC int
 sysfs_vnop_readdir(struct vnop_readdir_args *ap)
 {
+    OSAddAtomic64(1, &sysfs_stat_vnops);
     vnode_t vp = ap->a_vp;
     if (vnode_vtype(vp) != VDIR) {
         return ENOTDIR;
@@ -798,6 +809,7 @@ sysfs_copyout_dirent(int type, uint64_t file_id, const char *name, uio_t uio, in
 STATIC int
 sysfs_vnop_getattr(struct vnop_getattr_args *ap)
 {
+    OSAddAtomic64(1, &sysfs_stat_vnops);
     vnode_t vp = ap->a_vp;
     sfsnode_t *sysfs_node = VTOSFS(vp);
     sfssnode_t *snode = sysfs_node->node_structure_node;
@@ -889,6 +901,7 @@ sysfs_vnop_readlink(struct vnop_readlink_args *ap)
 STATIC int
 sysfs_vnop_read(struct vnop_read_args *ap)
 {
+    OSAddAtomic64(1, &sysfs_stat_vnops);
     vnode_t vp = ap->a_vp;
     sfsnode_t *snp = VTOSFS(vp);
     sfssnode_t *snode = snp->node_structure_node;

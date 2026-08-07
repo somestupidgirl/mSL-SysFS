@@ -49,6 +49,8 @@ extern vfstable_t sysfs_vfs_table_ref;
  * Sample them a few times a minute apart with /sys mounted: whichever one grows
  * without bound identifies the subsystem at fault.
  */
+extern int64_t sysfs_stat_vfs_getattr;
+extern int64_t sysfs_stat_vnops;
 extern int64_t sysfs_stat_snap_builds;
 extern int64_t sysfs_stat_snap_bytes;
 extern int64_t sysfs_stat_live_nodes;
@@ -118,10 +120,38 @@ static struct sysctl_oid sysfs_sysctl_live_nodes = {
     .oid_version = SYSCTL_OID_VERSION,
 };
 
+static struct sysctl_oid sysfs_sysctl_vfs_getattr = {
+    .oid_parent  = &sysfs_sysctl_children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_stat_vfs_getattr,
+    .oid_arg2    = 0,
+    .oid_name    = "vfs_getattr",
+    .oid_handler = sysctl_handle_quad,
+    .oid_fmt     = "Q",
+    .oid_descr   = "VFS_GETATTR (statfs) calls served for this mount",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
+static struct sysctl_oid sysfs_sysctl_vnops = {
+    .oid_parent  = &sysfs_sysctl_children,
+    .oid_number  = OID_AUTO,
+    .oid_kind    = CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_OID2,
+    .oid_arg1    = &sysfs_stat_vnops,
+    .oid_arg2    = 0,
+    .oid_name    = "vnops",
+    .oid_handler = sysctl_handle_quad,
+    .oid_fmt     = "Q",
+    .oid_descr   = "vnode operations served (lookup/getattr/readdir/read)",
+    .oid_version = SYSCTL_OID_VERSION,
+};
+
 STATIC void
 sysfs_sysctl_register(void)
 {
     sysctl_register_oid(&sysfs_sysctl_node);   /* parent first */
+    sysctl_register_oid(&sysfs_sysctl_vfs_getattr);
+    sysctl_register_oid(&sysfs_sysctl_vnops);
     sysctl_register_oid(&sysfs_sysctl_snap_builds);
     sysctl_register_oid(&sysfs_sysctl_snap_bytes);
     sysctl_register_oid(&sysfs_sysctl_live_nodes);
@@ -133,6 +163,8 @@ sysfs_sysctl_unregister(void)
     sysctl_unregister_oid(&sysfs_sysctl_live_nodes);
     sysctl_unregister_oid(&sysfs_sysctl_snap_bytes);
     sysctl_unregister_oid(&sysfs_sysctl_snap_builds);
+    sysctl_unregister_oid(&sysfs_sysctl_vnops);
+    sysctl_unregister_oid(&sysfs_sysctl_vfs_getattr);
     sysctl_unregister_oid(&sysfs_sysctl_node);
 }
 
