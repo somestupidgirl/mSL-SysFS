@@ -165,10 +165,35 @@ sysfs_mount(struct mount *mp, __unused vnode_t devvp, user_addr_t data, __unused
 
         /*
          * Install sysfs-specific flags and augment the generic mount flags.
-         * sysfs is a read-only synthetic view (as Linux /sys's root is) - it has
-         * no writable nodes yet, so MNT_RDONLY is appropriate. It is revisited
-         * when writable attributes arrive (the VFS layer rejects writes on a
-         * read-only mount before they can reach vnop_write).
+         *
+         * NOT MNT_RDONLY, deliberately. Advertising a read-only *synthetic local*
+         * volume makes CoreServices abort while registering the mount:
+         *
+         *     _CSAbortWithMessage <- FSNode_VolumeMounted
+         *                         <- FSNodeServer_SyncSystemUniverseInternal
+         *                         <- FileIDTreeServerGetVRefNumForDeviceInternal
+         *
+         * coreservicesd then relaunches, re-syncs its volume universe, hits the
+         * mount again and re-aborts - a crash loop that takes Launch Services
+         * down with it. That is the true cause of the long-standing "system
+         * gradually stops responding" symptom (typing stalls, apps refusing to
+         * launch, an unresponsive Dock) and of loginwindow's black screen at
+         * login, which is the same abort reached earlier in boot. None of it is
+         * visible from the kernel side: the abort is in userspace, provoked by
+         * the mount merely existing, so a full system spindump taken while /sys
+         * was mounted contained zero sysfs frames.
+         *
+         * The flag bought nothing. This filesystem registers no write, create,
+         * mkdir or setattr vnop, so every mutating operation already falls
+         * through to sysfs_vnop_default() and returns ENOTSUP; MNT_RDONLY only
+         * asked VFS to reject those same operations one layer earlier. Read-only
+         * behaviour is unchanged by its removal.
+         *
+         * The two synthetic filesystems that do not trigger the abort bracket
+         * the flag set and isolate MNT_RDONLY as the offender: procfs mounts
+         * MNT_LOCAL without it, and devfs mounts MNT_LOCAL|MNT_DONTBROWSE
+         * without it. MNT_DONTBROWSE is therefore kept - it is safe, and it is
+         * needed for the reason below.
          *
          * MNT_DONTBROWSE is essential, not cosmetic: without it the volume is
          * presented as a browsable local disk, so Finder/DiskArbitration and -
@@ -181,7 +206,7 @@ sysfs_mount(struct mount *mp, __unused vnode_t devvp, user_addr_t data, __unused
          * /proc and /sys are never indexed. (The procfs sibling gets away without
          * it only because /proc is shallow and cheap to walk.)
          */
-        vfs_setflags(mp, MNT_RDONLY|MNT_NOSUID|MNT_NOEXEC|MNT_NODEV|MNT_NOATIME|MNT_LOCAL|MNT_DONTBROWSE);
+        vfs_setflags(mp, MNT_NOSUID|MNT_NOEXEC|MNT_NODEV|MNT_NOATIME|MNT_LOCAL|MNT_DONTBROWSE);
 
         /*
          * Increment the mounted instance count so that each mount of the file system

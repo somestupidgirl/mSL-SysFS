@@ -176,8 +176,11 @@ int64_t sysfs_stat_vnops = 0;
  * registered as a file system and a pointer to that vector is stored in
  * sysfs_vnodeop_p.
  *
- * The file system is read-only (the mount is MNT_RDONLY), so there is no write /
- * setattr entry; those arrive with the first writable attribute.
+ * The file system is read-only, so there is no write / setattr entry; those
+ * arrive with the first writable attribute. Read-only-ness is enforced here
+ * rather than by the mount: every mutating vnop is absent from this table and
+ * so lands in sysfs_vnop_default(), which returns ENOTSUP. The mount is
+ * deliberately not MNT_RDONLY - see the flag discussion in sysfs_vfsops.c.
  */
 struct vnodeopv_entry_desc sysfs_vnodeop_entries[] = {
     { .opve_op = &vnop_default_desc,            .opve_impl = (VOPFUNC) sysfs_vnop_default },            /* default */
