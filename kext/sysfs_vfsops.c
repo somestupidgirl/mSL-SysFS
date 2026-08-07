@@ -166,6 +166,16 @@ sysfs_mount(struct mount *mp, __unused vnode_t devvp, user_addr_t data, __unused
         vfs_setfsprivate(mp, sysfs_mp);
 
         /*
+         * Let VFS allocate a system-wide unique fsid for this mount.
+         *
+         * This must not be hand-rolled. The low word of f_fsid is the device
+         * id, and userspace - CoreServices in particular - requires it to be
+         * unique across every mounted volume; it aborts on a duplicate. See the
+         * discussion in populate_statfs_info().
+         */
+        vfs_getnewfsid(mp);
+
+        /*
          * Install sysfs-specific flags and augment the generic mount flags.
          *
          * NOT MNT_RDONLY, deliberately. Advertising a read-only *synthetic local*
@@ -408,12 +418,25 @@ populate_statfs_info(struct mount *mp, struct vfsstatfs *statfsp)
     statfsp->f_ffree = 0;
 
     /*
-     * Compose fsid_t from the mount point id and the file system
-     * type number, which was assigned when the file system was
-     * registered. This pair of values just has to be unique.
+     * f_fsid is deliberately NOT composed here. It is assigned once, by
+     * vfs_getnewfsid(), in sysfs_mount().
+     *
+     * This used to be built as {pmnt_id, vfs_typenum(mp)} on the assumption
+     * that the *pair* only had to be unique. That assumption is wrong, and it
+     * was the cause of the system-wide hangs: consumers key on val[0] alone as
+     * the device id (the procfs sibling does exactly this - see its
+     * procfs_linux.c, "dev_t dev = (dev_t)st->f_fsid.val[0]"). pmnt_id is a
+     * per-filesystem counter starting at zero, so procfs's first mount and
+     * sysfs's first mount both published device id 1. CoreServices keeps one
+     * volume per device id in its FileIDTree and aborts outright on the
+     * duplicate:
+     *
+     *     "FileIDTree: volume for device id 0x%x already exists."
+     *
+     * killing coreservicesd every time it synced its volume universe, which is
+     * what made applications refuse to launch and the Dock stop responding
+     * whenever /sys was mounted alongside /proc.
      */
-    statfsp->f_fsid.val[0] = MPTOPMP(mp)->pmnt_id;
-    statfsp->f_fsid.val[1] = vfs_typenum(mp);
 
     bzero(statfsp->f_mntfromname, sizeof(statfsp->f_mntfromname));
     if (mounted_instance_count == 1) {
