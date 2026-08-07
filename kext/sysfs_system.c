@@ -54,6 +54,15 @@ sysfs_ncpu(void)
 }
 
 /*
+ * Public form of the above, for building the per-CPU tree at mount time.
+ */
+uint32_t
+sysfs_cpu_count(void)
+{
+    return sysfs_ncpu();
+}
+
+/*
  * Total physical memory in bytes.
  */
 static uint64_t
@@ -206,6 +215,106 @@ sysfs_do_node_list(__unused sfsnode_t *snp, uio_t uio, __unused vfs_context_t ct
     static const char node0[] = "0\n";
 
     return sysfs_copy_data(node0, (int)(sizeof(node0) - 1), uio);
+}
+
+/*
+ * How many logical CPUs share one physical core. Apple Silicon has no SMT, so
+ * this is 1; an Intel Mac with Hyper-Threading reports 2.
+ */
+static uint32_t
+sysfs_threads_per_core(void)
+{
+    int phys = 0;
+    size_t len = sizeof(phys);
+    uint32_t ncpu = sysfs_ncpu();
+
+    if (sysctlbyname("hw.physicalcpu_max", &phys, &len, NULL, 0) != 0 || phys <= 0) {
+        return 1;
+    }
+    if ((uint32_t)phys >= ncpu) {
+        return 1;
+    }
+    return ncpu / (uint32_t)phys;
+}
+
+/*
+ * The CPU number a per-CPU node stands for, carried on the structure node so one
+ * handler can serve every cpuN.
+ */
+static uint32_t
+sysfs_node_cpu(sfsnode_t *snp)
+{
+    return snp->node_structure_node->ssn_instance;
+}
+
+/*
+ * cpuN/online. macOS never offlines a core, so every CPU that exists is online.
+ */
+int
+sysfs_do_cpu_online(__unused sfsnode_t *snp, uio_t uio, __unused vfs_context_t ctx)
+{
+    static const char one[] = "1\n";
+
+    return sysfs_copy_data(one, (int)(sizeof(one) - 1), uio);
+}
+
+/*
+ * cpuN/topology/physical_package_id. Every Mac is single-socket, so every CPU is
+ * in package 0.
+ */
+int
+sysfs_do_cpu_package_id(__unused sfsnode_t *snp, uio_t uio, __unused vfs_context_t ctx)
+{
+    static const char pkg[] = "0\n";
+
+    return sysfs_copy_data(pkg, (int)(sizeof(pkg) - 1), uio);
+}
+
+/*
+ * cpuN/topology/core_id - which physical core this logical CPU sits on. Without
+ * SMT that is the CPU number itself; with Hyper-Threading the sibling threads of
+ * a core are consecutive, so dividing by the thread count gives the core.
+ */
+int
+sysfs_do_cpu_core_id(sfsnode_t *snp, uio_t uio, __unused vfs_context_t ctx)
+{
+    char buf[SYSFS_SYSTEM_BUFMAX];
+    uint32_t cpu = sysfs_node_cpu(snp);
+    uint32_t tpc = sysfs_threads_per_core();
+    int len = snprintf(buf, sizeof(buf), "%u\n", cpu / tpc);
+
+    return sysfs_copy_data(buf, len, uio);
+}
+
+/*
+ * cpuN/topology/thread_siblings_list - the logical CPUs sharing this core. Just
+ * this CPU without SMT; the consecutive run covering the core when SMT is on.
+ */
+int
+sysfs_do_cpu_thread_siblings(sfsnode_t *snp, uio_t uio, __unused vfs_context_t ctx)
+{
+    char buf[SYSFS_SYSTEM_BUFMAX];
+    uint32_t cpu = sysfs_node_cpu(snp);
+    uint32_t tpc = sysfs_threads_per_core();
+    int len;
+
+    if (tpc <= 1) {
+        len = snprintf(buf, sizeof(buf), "%u\n", cpu);
+    } else {
+        uint32_t first = (cpu / tpc) * tpc;
+        len = snprintf(buf, sizeof(buf), "%u-%u\n", first, first + tpc - 1);
+    }
+    return sysfs_copy_data(buf, len, uio);
+}
+
+/*
+ * cpuN/topology/core_siblings_list - the logical CPUs sharing this package.
+ * Single-socket, so that is every CPU.
+ */
+int
+sysfs_do_cpu_core_siblings(__unused sfsnode_t *snp, uio_t uio, vfs_context_t ctx)
+{
+    return sysfs_do_cpulist(snp, uio, ctx);
 }
 
 /*

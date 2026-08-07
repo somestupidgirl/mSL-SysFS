@@ -219,6 +219,14 @@ struct sfssnode {
     uint16_t                          ssn_flags;          /* Flags - SSN_FLAG_* */
 
     /*
+     * Which instance of a repeated node this is - the CPU number under
+     * /sys/devices/system/cpu/cpuN, for example. Lets one read handler serve a
+     * whole family of otherwise identical static nodes without a separate
+     * function per instance. Zero for nodes that are not part of such a family.
+     */
+    uint32_t                          ssn_instance;
+
+    /*
      * Structure linkage. Immutable once set.
      */
     struct sfssnode                  *ssn_parent;   /* The parent node in the structure */
@@ -453,6 +461,23 @@ extern int sysfs_do_node_distance(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 extern int sysfs_do_node_numastat(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 extern int sysfs_do_node_list(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
 extern int sysfs_do_cpu_kernel_max(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+
+/*
+ * Per-CPU nodes (/sys/devices/system/cpu/cpuN/...). These serve every cpuN from
+ * one handler, taking the CPU number from the structure node's ssn_instance.
+ */
+extern int sysfs_do_cpu_online(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpu_package_id(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpu_core_id(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpu_thread_siblings(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+extern int sysfs_do_cpu_core_siblings(sfsnode_t *snp, uio_t uio, vfs_context_t ctx);
+
+/*
+ * Number of logical CPUs, for building the per-CPU tree at mount time. macOS
+ * never hot-plugs a core, so the count is fixed for the life of the boot and the
+ * cpuN directories can be created statically.
+ */
+extern uint32_t sysfs_cpu_count(void);
 
 #endif /* __FSBUNDLE__ */
 

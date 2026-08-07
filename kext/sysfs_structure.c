@@ -23,6 +23,7 @@
 #include <string.h>
 #include <kern/assert.h>
 #include <kern/debug.h>
+#include <libkern/libkern.h>
 #include <libkern/OSMalloc.h>
 #include <mach/boolean.h>
 #include <sys/vnode.h>
@@ -49,6 +50,13 @@ STATIC void release_node(sfssnode_t *root);
  * tree is a few dozen nodes, so this is generous.
  */
 #define SYSFS_RELEASE_STACK_MAX 256
+
+/*
+ * Upper bound on generated /sys/devices/system/cpu/cpuN directories. The static
+ * tree is torn down through release_node()'s fixed-size stack, so the number of
+ * nodes the CPU loop can add has to stay well inside that bound.
+ */
+#define SYSFS_MAX_CPU_NODES 64
 
 /*
  * Next node id. No need to lock this value because access is guaranteed to be
@@ -206,12 +214,77 @@ sysfs_structure_init(void)
         add_file(cpu_dir, "present",    next_node_id++, 0, 0, NULL, sysfs_do_cpulist);
         add_file(cpu_dir, "offline",    next_node_id++, 0, 0, NULL, sysfs_do_zero_count);
         add_file(cpu_dir, "kernel_max", next_node_id++, 0, 0, NULL, sysfs_do_cpu_kernel_max);
+
+        /*
+         * cpu/cpuN/ with its topology. These are created statically, one per
+         * logical CPU, because macOS never hot-plugs a core: the count is fixed
+         * for the life of the boot, so there is nothing to expand dynamically.
+         * Each node carries its CPU number in ssn_instance, which is how one
+         * handler serves every cpuN.
+         */
+        uint32_t ncpu = sysfs_cpu_count();
+        for (uint32_t c = 0; c < ncpu && c < SYSFS_MAX_CPU_NODES; c++) {
+            char cpuname[MAX_STRUCT_NODE_NAME_LEN];
+            snprintf(cpuname, sizeof(cpuname), "cpu%u", c);
+
+            sfssnode_t *cpuN = add_directory(cpu_dir, cpuname,
+                            SFSdir, next_node_id++, 0, 0, NULL, NULL);
+            cpuN->ssn_instance = c;
+
+            sfssnode_t *f = add_file(cpuN, "online", next_node_id++, 0, 0,
+                            NULL, sysfs_do_cpu_online);
+            f->ssn_instance = c;
+
+            sfssnode_t *topo = add_directory(cpuN, "topology",
+                            SFSdir, next_node_id++, 0, 0, NULL, NULL);
+            topo->ssn_instance = c;
+
+            f = add_file(topo, "core_id", next_node_id++, 0, 0,
+                            NULL, sysfs_do_cpu_core_id);
+            f->ssn_instance = c;
+            f = add_file(topo, "physical_package_id", next_node_id++, 0, 0,
+                            NULL, sysfs_do_cpu_package_id);
+            f->ssn_instance = c;
+            f = add_file(topo, "thread_siblings_list", next_node_id++, 0, 0,
+                            NULL, sysfs_do_cpu_thread_siblings);
+            f->ssn_instance = c;
+            f = add_file(topo, "core_siblings_list", next_node_id++, 0, 0,
+                            NULL, sysfs_do_cpu_core_siblings);
+            f->ssn_instance = c;
+        }
+
         (void)add_directory(root_node, "firmware",   SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "fs",         SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "hypervisor", SFSdir, next_node_id++, 0, 0, NULL, NULL);
-        (void)add_directory(root_node, "kernel",     SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *kernel_dir =
+            add_directory(root_node, "kernel",     SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "module",     SFSdir, next_node_id++, 0, 0, NULL, NULL);
         (void)add_directory(root_node, "power",      SFSdir, next_node_id++, 0, 0, NULL, NULL);
+
+        /*
+         * /sys/kernel/mm/hugepages/hugepages-2048kB/ - the system-wide huge-page
+         * pool, the counterpart to the per-node counters above. Linux exposes two
+         * extra knobs here that have no per-node equivalent (reservations and the
+         * overcommit limit); like the rest they are 0, because macOS has no
+         * hugetlb pool to reserve from or overcommit.
+         */
+        sfssnode_t *mm_dir = add_directory(kernel_dir, "mm",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *mm_hp_dir = add_directory(mm_dir, "hugepages",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+        sfssnode_t *mm_hp_2m = add_directory(mm_hp_dir, "hugepages-2048kB",
+                        SFSdir, next_node_id++, 0, 0, NULL, NULL);
+
+        add_file(mm_hp_2m, "nr_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(mm_hp_2m, "free_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(mm_hp_2m, "surplus_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(mm_hp_2m, "resv_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
+        add_file(mm_hp_2m, "nr_overcommit_hugepages", next_node_id++, 0,
+                        SYSFS_ZERO_COUNT_LEN, NULL, sysfs_do_zero_count);
     }
 }
 
